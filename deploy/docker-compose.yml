@@ -17,7 +17,11 @@ name: xiangqi
 
 services:
   mysql:
-    image: mysql:8.4
+    # 默认用 Docker Hub 官方镜像（本地开发够用）。
+    # 生产服务器若拉不动 Docker Hub，就把它指向自己的镜像仓库，例如：
+    #   MYSQL_IMAGE=registry.cn-hangzhou.aliyuncs.com/<命名空间>/mysql:8.4
+    # scripts/deploy.sh 会把 .env.deploy 里的 MYSQL_IMAGE 注入服务器端 .env。
+    image: "${MYSQL_IMAGE:-mysql:8.4}"
     container_name: xiangqi-mysql
     restart: unless-stopped
     command:

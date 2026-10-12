@@ -76,6 +76,9 @@ fi
 : "${ACR_PASSWORD:?请设置 ACR_PASSWORD}"
 
 SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+# .env 里若写成 "~/.ssh/xxx"（带引号），bash 的 source 不会展开波浪号，
+# 会得到一个字面量路径。这里统一补展开，避免调试半天。
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
 IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/xiangqi"
 IMAGE_TAG="$IMAGE:$TAG"
 
@@ -158,10 +161,15 @@ deploy_one() {
   # 生成服务器端 .env：沿用源文件的变量，但镜像与运行环境由本次部署决定
   local tmp_env
   tmp_env="$(mktemp)"
-  grep -vE '^(XIANGQI_IMAGE|XIANGQI_ENV)=' "$SRC_ENV" > "$tmp_env" || true
+  grep -vE '^(XIANGQI_IMAGE|XIANGQI_ENV|MYSQL_IMAGE)=' "$SRC_ENV" > "$tmp_env" || true
   {
     printf 'XIANGQI_IMAGE=%s\n' "$IMAGE_TAG"
     printf 'XIANGQI_ENV=production\n'
+    # 服务器若拉不动 Docker Hub（加速器缺某些镜像），
+    # 就把 .env.deploy 里的 MYSQL_IMAGE 指向自己的镜像仓库。
+    if [ -n "${MYSQL_IMAGE:-}" ]; then
+      printf 'MYSQL_IMAGE=%s\n' "$MYSQL_IMAGE"
+    fi
   } >> "$tmp_env"
   chmod 600 "$tmp_env"
   scp -i "$SSH_KEY" -P "$port" -o StrictHostKeyChecking=accept-new \
