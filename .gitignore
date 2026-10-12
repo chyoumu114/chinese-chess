@@ -29,3 +29,6 @@ Thumbs.db
 # 日后有人把它改成 `/.env`（只匹配根目录），从而让 deploy/.env
 # 里的真实凭据被误提交。deploy/.env.example 是模板，仍需提交。
 deploy/.env
+# 部署用的镜像仓库凭据与生产配置，同样绝不入库
+deploy/.env.deploy
+deploy/.env.prod
