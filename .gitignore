@@ -1,0 +1,31 @@
+# Build output
+/bin/
+
+# Dependency and build caches. These live inside the workspace because the
+# default Go and npm cache locations are outside it on this machine, and the
+# toolchain must be able to write to them.
+/.cache/
+
+# Go
+*.exe
+*.test
+*.out
+
+# Node
+node_modules/
+web/dist/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local overrides
+.env
+.env.local
+# 显式再列一次：`.env` 模式本已匹配任意层级，这一行是为了防止
+# 日后有人把它改成 `/.env`（只匹配根目录），从而让 deploy/.env
+# 里的真实凭据被误提交。deploy/.env.example 是模板，仍需提交。
+deploy/.env

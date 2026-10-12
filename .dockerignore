@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Docker 构建上下文排除清单
+#
+# 构建上下文是仓库根（deploy/Dockerfile 以 context: .. 调用），
+# 缺少这个文件会导致两个确定性问题：
+#
+#   1. 上下文从不足 1 MB 膨胀到 536 MB —— 每次构建都要把这些数据传给
+#      daemon。实测：.cache 373 MB、server/.cache 113 MB、
+#      web/node_modules 39 MB、bin 10 MB。
+#
+#   2. 宿主机的 web/node_modules 是 Windows 平台专用的
+#      （@esbuild/win32-x64、@rollup/rollup-win32-x64-gnu、-msvc）。
+#      Dockerfile 的 `COPY web/ ./` 会把它带进 Linux 容器，覆盖容器内
+#      `npm install` 装好的 Linux 版依赖，可能让 esbuild / rollup 的
+#      原生二进制无法执行，构建因此失败或产出错误的镜像。
+#
+# 另外 .env 保存真实凭据，绝不能进入构建上下文。
+# ---------------------------------------------------------------------------
+
+# 依赖与构建产物：镜像内会重新安装与构建
+web/node_modules
+web/dist
+bin
+
+# 工具链缓存（Go 构建缓存、Go 模块缓存、npm 缓存）
+.cache
+server/.cache
+
+# 本地配置与凭据：真实值绝不进入构建上下文（模板本身不是秘密，无需排除）
+.env
+.env.local
+.env.*.local
+
+# 版本控制与编辑器
+.git
+.gitignore
+.idea
+.vscode
+*.swp
+
+# 文档与宿主机专用脚本（PowerShell 构建脚本只在 Windows 侧使用）
+docs
+scripts
+
+# Docker 自身：编排文件与构建说明不需要进入镜像
+deploy/docker-compose.yml
+deploy/docker-compose.prod.yml
+deploy/.dockerignore
+.dockerignore
+Dockerfile
+
+# 端到端验收程序的源码（镜像只构建 ./cmd/server，不需要它）
+server/cmd/e2e

@@ -1,0 +1,72 @@
+# 持续集成：每次推送与 PR 都跑后端规则测试和前端测试构建。
+#
+# 触发来源：主仓库在 Gitee，通过「仓库镜像管理」同步到 GitHub。
+# 镜像推送产生的 commit 同样会触发本工作流，所以本地开发不需要开代理。
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支有新推送时取消上一次未跑完的任务，省额度也省等待。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Go 后端
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go（版本直接取自 server/go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          # 路径相对仓库根，不受上面的 working-directory 影响。
+          cache-dependency-path: server/go.sum
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 单元测试
+        # store 包的 MySQL 集成测试在拿不到数据库时会自动跳过，
+        # 因此这里不需要额外的 service 容器。
+        run: go test ./... -count=1
+
+  web:
+    name: Vue 前端
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node（与 deploy/Dockerfile 的 node:20 保持一致）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 按锁文件安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 前端测试
+        run: npm test
+
+      - name: 构建产物
+        run: npm run build

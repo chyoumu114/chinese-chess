@@ -1,0 +1,215 @@
+# 发布：构建镜像推送到阿里云 ACR，再逐台更新服务器。
+#
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# 也可以手动触发：Actions → Release → Run workflow。
+#
+# 设计要点：
+#   * 镜像只构建一次，所有服务器拉取同一个 tag —— 多机版本绝对一致。
+#   * 服务器清单放在 deploy/servers.json（不含密钥），用 needs 输出 + fromJSON
+#     构造 matrix。这是为了避开一个不可靠的用法：secrets 上下文在
+#     jobs.<job_id>.strategy 里并不可靠，secrets[...] 动态索引也有争议。
+#     needs 输出则在 strategy 中是明确可用的。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: '镜像标签；留空则用 <tag 或分支>-<短 sha>'
+        required: false
+        type: string
+
+env:
+  IMAGE_NAME: xiangqi
+  APP_DIR_FALLBACK: /opt/xiangqi
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: 读取服务器清单
+    runs-on: ubuntu-latest
+    outputs:
+      servers: ${{ steps.list.outputs.servers }}
+      exists: ${{ steps.list.outputs.exists }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 读取 deploy/servers.json
+        id: list
+        run: |
+          if [ -f deploy/servers.json ]; then
+            # jq -c 压成单行，方便作为 job 输出传递
+            echo "servers=$(jq -c . deploy/servers.json)" >> "$GITHUB_OUTPUT"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "将部署到以下服务器："
+            jq -r '.[] | "  - \(.name)  \(.user)@\(.host):\(.port)  \(.app_dir)"' deploy/servers.json
+          else
+            echo "servers=[]" >> "$GITHUB_OUTPUT"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::deploy/servers.json 不存在，本次只构建镜像，跳过部署"
+          fi
+
+  build:
+    name: 构建并推送镜像
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 计算镜像地址
+        id: meta
+        env:
+          REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+          REQUESTED: ${{ inputs.image_tag }}
+        run: |
+          # ${VAR:0:7} 取前 7 位。拆成两步写，避免嵌套展开出现连续右花括号而误导静态检查
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          DEFAULT_TAG="${GITHUB_REF_NAME}-${SHORT_SHA}"
+          TAG="${REQUESTED:-$DEFAULT_TAG}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "本次镜像：${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${TAG}"
+
+      - name: 登录阿里云 ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: 启用 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          # 用 GitHub Actions 缓存，显著加快重复构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: 更新 ${{ matrix.server.name }}
+    needs: [prepare, build]
+    if: needs.prepare.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # 某台失败不影响其余服务器
+      fail-fast: false
+      # 串行更新：避免所有节点同时重启造成服务中断
+      max-parallel: 1
+      matrix:
+        server: ${{ fromJSON(needs.prepare.outputs.servers) }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 SSH 密钥
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ matrix.server.host }}
+          PORT: ${{ matrix.server.port }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # 预取主机指纹，之后指纹若变化连接会被拒绝（防中间人）
+          ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: 在本地生成服务器端 .env
+        env:
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          XIANGQI_JWT_SECRET: ${{ secrets.XIANGQI_JWT_SECRET }}
+          XIANGQI_ALLOWED_ORIGINS: ${{ vars.XIANGQI_ALLOWED_ORIGINS }}
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          # 用 env 中转再写文件，避免密码里的特殊字符被 shell 二次解释
+          cat > /tmp/xiangqi.env <<EOF
+          # 本文件由 CI 依据仓库 Secrets 生成，请勿在服务器上手工修改。
+          MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+          MYSQL_DATABASE=xiangqi
+          MYSQL_USER=xiangqi
+          MYSQL_PASSWORD=${MYSQL_PASSWORD}
+          MYSQL_BIND=127.0.0.1
+          MYSQL_PORT=3306
+          XIANGQI_PORT=8080
+          XIANGQI_ENV=production
+          XIANGQI_JWT_SECRET=${XIANGQI_JWT_SECRET}
+          XIANGQI_ALLOWED_ORIGINS=${XIANGQI_ALLOWED_ORIGINS}
+          XIANGQI_IMAGE=${IMAGE}
+          EOF
+          chmod 600 /tmp/xiangqi.env
+          echo "已生成 .env，字段如下（值不打印）："
+          cut -d= -f1 /tmp/xiangqi.env
+
+      - name: 同步编排文件与 .env 到服务器
+        env:
+          HOST: ${{ matrix.server.host }}
+          PORT: ${{ matrix.server.port }}
+          USER_NAME: ${{ matrix.server.user }}
+          APP_DIR: ${{ matrix.server.app_dir }}
+        run: |
+          set -euo pipefail
+          SSH_OPTS="-i $HOME/.ssh/deploy_key -p $PORT -o StrictHostKeyChecking=yes"
+          ssh $SSH_OPTS "$USER_NAME@$HOST" "mkdir -p '$APP_DIR/deploy'"
+          # 注意 scp 的端口参数是大写 -P，ssh 是小写 -p
+          scp -i "$HOME/.ssh/deploy_key" -P "$PORT" -o StrictHostKeyChecking=yes \
+            deploy/docker-compose.yml \
+            deploy/docker-compose.prod.yml \
+            "$USER_NAME@$HOST:$APP_DIR/deploy/"
+          scp -i "$HOME/.ssh/deploy_key" -P "$PORT" -o StrictHostKeyChecking=yes \
+            /tmp/xiangqi.env "$USER_NAME@$HOST:$APP_DIR/deploy/.env"
+
+      - name: 拉取镜像并滚动重启
+        env:
+          HOST: ${{ matrix.server.host }}
+          PORT: ${{ matrix.server.port }}
+          USER_NAME: ${{ matrix.server.user }}
+          APP_DIR: ${{ matrix.server.app_dir }}
+          REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # heredoc 未加引号，所以 $VAR 一律在本地展开后再交给远端 bash 执行。
+          # 注意：ACR 密码必须能在本地展开（远端没有该变量），因此不能写成 \${...}。
+          # 这要求密码本身不含 $ " ` 等会被远端 bash 二次解析的字符 ——
+          # 所以 Secrets 里的密码一律用 `openssl rand -hex 32` 生成。
+          ssh -i "$HOME/.ssh/deploy_key" -p "$PORT" -o StrictHostKeyChecking=yes \
+            "$USER_NAME@$HOST" bash -s <<REMOTE
+          set -euo pipefail
+          cd "$APP_DIR/deploy"
+          if [ -n "${ACR_PASSWORD}" ]; then
+            printf '%s' "${ACR_PASSWORD}" | docker login "$REGISTRY" -u "$ACR_USERNAME" --password-stdin
+          fi
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
+          # 清理旧镜像，避免服务器磁盘被历史版本占满
+          docker image prune -f
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+          REMOTE
+
+      - name: 健康检查
+        env:
+          HOST: ${{ matrix.server.host }}
+          PORT: ${{ matrix.server.port }}
+          USER_NAME: ${{ matrix.server.user }}
+        run: |
+          # 远端重试 30 次，最多等 60 秒
+          ssh -i "$HOME/.ssh/deploy_key" -p "$PORT" -o StrictHostKeyChecking=yes \
+            "$USER_NAME@$HOST" \
+            'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/api/health && exit 0; sleep 2; done; echo "健康检查超时"; exit 1'

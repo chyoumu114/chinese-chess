@@ -1,0 +1,35 @@
+# 统一行尾策略，避免 Windows / WSL / 容器三处互相污染。
+#
+# 背景：Windows 版 Git 默认 core.autocrlf=true，检出时会把 LF 转成 CRLF。
+# 若用它操作 WSL 里的仓库（例如用 SourceTree 打开 \\wsl.localhost\... 路径），
+# shell 脚本会被改成 CRLF，在 Linux 里执行时报：
+#     /bin/bash^M: bad interpreter: No such file or directory
+# 而且 git status 会满屏显示文件被修改，极易误提交。
+#
+# 这个文件让仓库自身声明行尾规则，不依赖各人本机的 git 配置。
+
+# 默认：仓库内一律 LF，检出时也不做转换
+* text=auto eol=lf
+
+# Windows 专用脚本保持 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不做任何行尾转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.eot  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.exe  binary
+*.dll  binary
+*.so   binary

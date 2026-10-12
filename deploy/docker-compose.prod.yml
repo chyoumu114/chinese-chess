@@ -1,0 +1,26 @@
+# 生产覆盖层：镜像改为从阿里云 ACR 拉取，且不对外暴露数据库端口。
+#
+#   cd deploy
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# ⚠️ 为什么必须用 !reset 标签，而不能写 `ports: []`：
+#
+#   Compose 合并多个文件时，列表类型（ports、volumes、secrets、configs）
+#   默认是「追加」而不是「替换」。写 `ports: []` 清不掉基础文件里的端口——
+#   空列表追加等于什么都没做，3306 依然会暴露。
+#
+#   !reset / !override 是 Compose v2.24.4+ 提供的合并控制标签：
+#     !reset    移除该属性，恢复为类型默认值或 null
+#     !override 完全替换该属性，绕过标准合并规则
+services:
+  mysql:
+    # 移除基础文件里的端口映射：生产环境数据库只在容器网络内可达。
+    ports: !reset []
+
+  server:
+    # 移除继承来的 build 段：生产只拉取 CI 构建好的镜像，不在服务器上编译。
+    build: !reset null
+    image: "${XIANGQI_IMAGE:?生产环境必须在 .env 中指定 ACR 镜像地址}"
+    environment:
+      # 触发生产校验：serve 会拒绝默认的 JWT 占位密钥。
+      XIANGQI_ENV: production

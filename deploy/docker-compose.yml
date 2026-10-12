@@ -1,0 +1,81 @@
+# 本地开发编排：一条命令起全站。
+#
+#   cd deploy
+#   cp .env.example .env          # 首次使用，填写真实值
+#   docker compose up -d --build
+#
+# 只在 IDE 里调后端、不需要容器化后端时，可以只起数据库：
+#
+#   docker compose up -d mysql
+#
+# 凭据全部来自同目录的 .env（已被 .gitignore 忽略）。
+# 变量缺失时立即报错，避免用错配置静默启动。
+
+# 显式指定项目名。否则 Compose 会用目录名，推导出 "deploy"，
+# 网络随之变成 deploy_default —— 与项目无关且日后难以辨认。
+name: xiangqi
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: xiangqi-mysql
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?请在 deploy/.env 中设置 MYSQL_ROOT_PASSWORD}"
+      MYSQL_DATABASE: "${MYSQL_DATABASE:-xiangqi}"
+      MYSQL_USER: "${MYSQL_USER:-xiangqi}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:?请在 deploy/.env 中设置 MYSQL_PASSWORD}"
+    ports:
+      # 默认只绑本机，供 Windows 侧的 IDE / 数据库工具连接 127.0.0.1:3306。
+      # 需要局域网访问时才把 MYSQL_BIND 改成 0.0.0.0。
+      - "${MYSQL_BIND:-127.0.0.1}:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # server 会一直等到数据库健康为止。
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1",
+             "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  server:
+    build:
+      # 构建上下文必须是仓库根：Dockerfile 需要同时看到 web/ 与 server/。
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: "${XIANGQI_IMAGE:-xiangqi:dev}"
+    container_name: xiangqi-server
+    restart: unless-stopped
+    # 数据库由 MySQL 容器的 MYSQL_DATABASE 创建。
+    # 应用侧必须关掉自动建库：MYSQL_USER 是普通账号，没有 CREATE DATABASE
+    # 权限，默认的建库逻辑会以 Access denied 直接失败。
+    command: ["-no-create-db"]
+    environment:
+      XIANGQI_ENV: "${XIANGQI_ENV:-development}"
+      XIANGQI_ADDR: ":8080"
+      XIANGQI_PUBLIC_DIR: /app/web/dist
+      XIANGQI_DB_HOST: mysql
+      XIANGQI_DB_PORT: "3306"
+      XIANGQI_DB_NAME: "${MYSQL_DATABASE:-xiangqi}"
+      XIANGQI_DB_USER: "${MYSQL_USER:-xiangqi}"
+      XIANGQI_DB_PASSWORD: "${MYSQL_PASSWORD:?请在 deploy/.env 中设置 MYSQL_PASSWORD}"
+      XIANGQI_JWT_SECRET: "${XIANGQI_JWT_SECRET:?请在 deploy/.env 中设置 XIANGQI_JWT_SECRET}"
+      XIANGQI_ALLOWED_ORIGINS: "${XIANGQI_ALLOWED_ORIGINS:-}"
+      XIANGQI_TURN_TIMEOUT: "${XIANGQI_TURN_TIMEOUT:-0}"
+      XIANGQI_GAME_TIMEOUT: "${XIANGQI_GAME_TIMEOUT:-0}"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${XIANGQI_PORT:-8080}:8080"
+    # 用 tini 做 PID 1，保证 SIGTERM 正确传递给应用，
+    # 让 server 的优雅关闭逻辑（main.go 里的 signal.NotifyContext）生效。
+    init: true
+
+volumes:
+  mysql-data:
