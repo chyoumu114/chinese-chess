@@ -80,7 +80,9 @@ a {
 
 .game-layout {
   display: grid;
-  grid-template-columns: minmax(300px, 1fr) minmax(280px, 360px);
+  /* 右列写死宽度，不能用 minmax 浮动：侧栏里的聊天、着法列表一长，本来会把右列
+     撑宽、把棋盘那一列压窄，棋盘随之缩放，看起来就是「棋盘动来动去」。 */
+  grid-template-columns: minmax(300px, 1fr) 360px;
   gap: 18px;
   align-items: start;
 }
@@ -312,4 +314,101 @@ textarea:focus {
   background: #eef4fd;
   border: 1px solid #c3d7f2;
   color: #2c5282;
+}
+
+/* ===== MOBILE RESPONSIVE =====
+   手机端适配（目标宽度 360px–430px）。
+   所有规则都位于 max-width 媒体查询内，桌面端（>=1024px）视觉完全不变。
+   表格页按需启用：给 <table> 加 .table-cards，并给每个 <td> 加 data-label="列名"。
+   ============================================================ */
+
+/* ---- 1. 窄屏通用基元 ---- */
+@media (max-width: 640px) {
+  /* 表单控件：16px 字号避免 iOS 聚焦自动放大，44px 高度便于手指点按 */
+  input[type='text'],
+  input[type='password'],
+  input[type='number'],
+  select,
+  textarea {
+    font-size: 1rem;
+    min-height: 44px;
+  }
+
+  /* auto-fit 的 320px 下限在 360px 屏上会撑破容器，直接压成单列 */
+  .grid-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- 2. 表格 → 卡片（按需启用，不影响未加 .table-cards 的表格）---- */
+@media (max-width: 640px) {
+  .table-cards {
+    display: block;
+    width: 100%;
+  }
+
+  .table-cards thead {
+    display: none;
+  }
+
+  .table-cards tbody {
+    display: block;
+  }
+
+  .table-cards tr {
+    display: block;
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    background: #fffdf8;
+  }
+
+  .table-cards tr:last-child {
+    margin-bottom: 0;
+  }
+
+  /* 卡片本身可点（棋谱列表），去掉桌面端的 hover 底色 */
+  .table-cards tr:hover {
+    background: #fffdf8;
+  }
+
+  .table-cards tr.selected {
+    background: #fbe6ac;
+    border-color: #e8cf94;
+  }
+
+  .table-cards td {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: flex-end;
+    gap: 4px 8px;
+    padding: 7px 0;
+    border-bottom: 1px dashed var(--border-soft);
+    text-align: right;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .table-cards td:first-child {
+    padding-top: 2px;
+  }
+
+  .table-cards td:last-child {
+    border-bottom: none;
+    padding-bottom: 2px;
+  }
+
+  /* 左侧列名：margin-right auto 让右侧的值始终贴右，多值单元格也不会溢出 */
+  .table-cards td::before {
+    content: attr(data-label);
+    flex: none;
+    margin-right: auto;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-align: left;
+  }
 }

@@ -31,8 +31,8 @@ export const state = reactive({
   pending: { draw: '', takeback: '' },
   /** Toast notifications: { id, kind, text }. */
   toasts: [],
-  /** Lobby payload from GET /api/lobby. */
-  lobby: { openRooms: [], playing: 0 },
+  /** Lobby payload from GET /api/lobby. playingRooms are games under way. */
+  lobby: { openRooms: [], playingRooms: [], playing: 0 },
   /** Cached GET /api/rules payload (board geometry, start FEN). */
   rules: null
 })
@@ -227,12 +227,46 @@ export function connectRealtime() {
   ws.connect()
 }
 
+// ---- lobby -----------------------------------------------------------------
+
+/**
+ * loadLobby refreshes GET /api/lobby into the shared state.
+ *
+ * The payload gained `playingRooms` (rooms whose status is "playing", which
+ * anyone may watch). An older backend does not send that array, so every list is
+ * normalised here: a missing or malformed field becomes an empty array instead of
+ * breaking the lobby.
+ */
+export async function loadLobby() {
+  const data = (await api.lobby()) || {}
+  state.lobby = {
+    ...data,
+    openRooms: Array.isArray(data.openRooms) ? data.openRooms : [],
+    playingRooms: Array.isArray(data.playingRooms) ? data.playingRooms : [],
+    playing: data.playing ?? 0
+  }
+  return state.lobby
+}
+
 // ---- room helpers ----------------------------------------------------------
 
 /** joinRoom asks the server to seat us: a specific room, a match, or the AI. */
 export function joinRoom(payload = {}) {
   connectRealtime()
   const ok = protocol.join(payload)
+  if (!ok) {
+    toast('连接尚未就绪，正在重连…', 'warn')
+  }
+  return ok
+}
+
+/**
+ * watchRoom attaches as a spectator. `watch` takes no seat, so the room snapshot
+ * the server answers with carries an empty `youAre`; `leave` stops watching.
+ */
+export function watchRoom(roomId) {
+  connectRealtime()
+  const ok = protocol.watchRoom(roomId)
   if (!ok) {
     toast('连接尚未就绪，正在重连…', 'warn')
   }

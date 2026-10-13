@@ -400,7 +400,11 @@ func (s *Session) joinSpecific(req JoinRequest) (int64, game.Side, error) {
 	if !ok {
 		return 0, game.Red, ErrRoomNotFound
 	}
-	if r.Status == StatusFinished {
+	// A finished room only turns people away when it is full. After somebody
+	// walked out mid-game the room keeps a free seat, and a spectator is
+	// allowed to take it: the room then waits for both sides to press 准备,
+	// exactly like any other rematch.
+	if r.Status == StatusFinished && r.Filled() {
 		return 0, game.Red, ErrGameFinished
 	}
 	// Rejoining your own seat.
@@ -832,6 +836,10 @@ func (s *Session) SubmitAIMove(ctx context.Context, roomID int64, mv game.Move) 
 	if !ok {
 		return MoveOutcome{}, ErrRoomNotFound
 	}
+	// 搜索已经结束，无论这一步最终是否被采纳，都要把认领标志放掉。否则一次过期的
+	// 着法（例如玩家在电脑思考期间悔了棋）会让认领永远挂在那里，电脑此后再也轮不到
+	// 走棋，棋盘就卡死了。
+	r.aiThinking = false
 	if r.Status != StatusPlaying {
 		return MoveOutcome{}, ErrGameNotStarted
 	}
@@ -839,7 +847,6 @@ func (s *Session) SubmitAIMove(ctx context.Context, roomID int64, mv game.Move) 
 	if !r.SeatFor(side).IsAI {
 		return MoveOutcome{}, ErrNotYourTurn
 	}
-	r.aiThinking = false
 	return s.applyMoveLocked(ctx, r, side, mv.FromName(), mv.ToName())
 }
 
@@ -886,6 +893,12 @@ func (s *Session) applyMoveLocked(ctx context.Context, r *Room, side game.Side, 
 		MSSpent:  spent,
 	}
 	r.Moves = append(r.Moves, rec)
+	// 局面一变，挂起的悔棋请求就失去意义了：对手这时再点「同意」，撤掉的是刚走的
+	// 这一步，而不是当初请求的那一步。所以任何一步棋落地都让它作废。
+	if r.HasTakebackRequest {
+		r.HasTakebackRequest = false
+		r.TakebackRequestedBy = game.Red
+	}
 	if s.recorder != nil && r.PersistedID != 0 {
 		s.recorder.AddMove(ctx, r.PersistedID, rec)
 	}
@@ -1079,25 +1092,38 @@ func (s *Session) ExpireTimeouts(ctx context.Context) []ExpiredGame {
 }
 
 // OfferDraw records a draw offer from a seated player.
-func (s *Session) OfferDraw(roomID, userID int64) (game.Side, error) {
+//
+// Against the computer the offer is accepted on the spot: a human offering a
+// draw to an engine is asking for the game to stop, and leaving them to wait for
+// a reply that never comes is just a dead end. The returned *Result is non-nil
+// exactly when the computer accepted, i.e. when the game is already over.
+func (s *Session) OfferDraw(ctx context.Context, roomID, userID int64) (game.Side, *Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	r, ok := s.rooms[roomID]
 	if !ok {
-		return game.Red, ErrRoomNotFound
+		return game.Red, nil, ErrRoomNotFound
 	}
 	if r.Status != StatusPlaying {
-		return game.Red, ErrGameNotStarted
+		return game.Red, nil, ErrGameNotStarted
 	}
 	side, ok := r.SideOf(userID)
 	if !ok {
-		return game.Red, ErrNotASeat
+		return game.Red, nil, ErrNotASeat
+	}
+	if r.SeatFor(side.Opponent()).IsAI {
+		if err := r.Game.Draw(game.ReasonDrawAgreed); err != nil {
+			return side, nil, err
+		}
+		res := s.finishLocked(ctx, r)
+		s.notify([]int64{r.ID})
+		return side, res, nil
 	}
 	r.DrawOfferedBy = side
 	r.HasDrawOffer = true
 	s.notify([]int64{r.ID})
-	return side, nil
+	return side, nil, nil
 }
 
 // RespondDraw accepts or declines an outstanding draw offer. Accepting ends the
@@ -1134,28 +1160,60 @@ func (s *Session) RespondDraw(ctx context.Context, roomID, userID int64, accept 
 }
 
 // RequestTakeback records a takeback request.
-func (s *Session) RequestTakeback(roomID, userID int64) (game.Side, error) {
+//
+// Against the computer the request is granted on the spot. The rewind then goes
+// back to before the player's own last move: the engine has already answered, so
+// undoing a single ply would only invite it to play the same move again. The
+// returned *Room is non-nil exactly when the computer accepted.
+func (s *Session) RequestTakeback(roomID, userID int64) (game.Side, *Room, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	r, ok := s.rooms[roomID]
 	if !ok {
-		return game.Red, ErrRoomNotFound
+		return game.Red, nil, ErrRoomNotFound
 	}
 	if r.Status != StatusPlaying {
-		return game.Red, ErrGameNotStarted
+		return game.Red, nil, ErrGameNotStarted
 	}
 	side, ok := r.SideOf(userID)
 	if !ok {
-		return game.Red, ErrNotASeat
+		return game.Red, nil, ErrNotASeat
 	}
 	if len(r.Moves) == 0 {
-		return game.Red, ErrNothingPending
+		return game.Red, nil, ErrNothingPending
+	}
+	if r.SeatFor(side.Opponent()).IsAI {
+		if last := r.Moves[len(r.Moves)-1]; last.Side == SideName(side.Opponent()) {
+			s.acceptTakebackLocked(r, side)
+		}
+		s.acceptTakebackLocked(r, side)
+		s.notify([]int64{r.ID})
+		return side, r, nil
 	}
 	r.TakebackRequestedBy = side
 	r.HasTakebackRequest = true
 	s.notify([]int64{r.ID})
-	return side, nil
+	return side, nil, nil
+}
+
+// acceptTakebackLocked rewinds one accepted ply. side is the player who asked,
+// so the move counter goes back on their opponent's account. Caller holds the
+// lock.
+func (s *Session) acceptTakebackLocked(r *Room, side game.Side) {
+	if _, ok := r.Game.Undo(); !ok {
+		return
+	}
+	if len(r.Moves) > 0 {
+		r.Moves = r.Moves[:len(r.Moves)-1]
+	}
+	for _, other := range []game.Side{game.Red, game.Black} {
+		seat := r.SeatFor(other)
+		if seat.MoveCount > 0 && other == side.Opponent() {
+			seat.MoveCount--
+		}
+	}
+	s.armClockLocked(r)
 }
 
 // RespondTakeback accepts or declines an outstanding takeback request. A single
@@ -1179,24 +1237,9 @@ func (s *Session) RespondTakeback(roomID, userID int64, accept bool) (*Room, err
 		return nil, fmt.Errorf("gamehall: you made the takeback request")
 	}
 	r.HasTakebackRequest = false
-	if !accept {
-		s.notify([]int64{r.ID})
-		return r, nil
+	if accept {
+		s.acceptTakebackLocked(r, side)
 	}
-	if _, ok := r.Game.Undo(); !ok {
-		s.notify([]int64{r.ID})
-		return r, nil
-	}
-	if len(r.Moves) > 0 {
-		r.Moves = r.Moves[:len(r.Moves)-1]
-	}
-	for _, s := range []game.Side{game.Red, game.Black} {
-		seat := r.SeatFor(s)
-		if seat.MoveCount > 0 && s == side.Opponent() {
-			seat.MoveCount--
-		}
-	}
-	s.armClockLocked(r)
 	s.notify([]int64{r.ID})
 	return r, nil
 }
@@ -1368,6 +1411,48 @@ func (s *Session) OpenRooms() []OpenRoom {
 			side = "black"
 		}
 		out = append(out, OpenRoom{ID: r.ID, HostName: host.Name, HostSide: side, Rated: r.Rated, CreatedAt: r.CreatedAt})
+	}
+	return out
+}
+
+// PlayingRoom is one row of the lobby's "对战中" list. It is deliberately much
+// thinner than RoomView: the lobby polls this every few seconds and has no use
+// for the board or the move list.
+type PlayingRoom struct {
+	ID        int64
+	RedName   string
+	BlackName string
+	MoveCount int
+	Rated     bool
+	CreatedAt time.Time
+}
+
+// PlayingRooms lists the rooms whose game is running, newest first. Anybody may
+// watch one, and watching never takes a seat.
+func (s *Session) PlayingRooms() []PlayingRoom {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]PlayingRoom, 0, len(s.rooms))
+	for _, r := range s.rooms {
+		if r.Status != StatusPlaying {
+			continue
+		}
+		out = append(out, PlayingRoom{
+			ID:        r.ID,
+			RedName:   r.Red.Name,
+			BlackName: r.Black.Name,
+			MoveCount: len(r.Moves),
+			Rated:     r.Rated,
+			CreatedAt: r.CreatedAt,
+		})
+	}
+	// Newest first. Insertion sort: the list is tiny and this avoids pulling in
+	// another import just for one sort.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].ID > out[j-1].ID; j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
 	}
 	return out
 }

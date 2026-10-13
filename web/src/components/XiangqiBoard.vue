@@ -333,7 +333,13 @@ defineExpose({ clearSelection: () => (selected.value = '') })
 </script>
 
 <template>
-  <div class="board-wrap" :class="{ 'board-interactive': interactive }">
+  <!-- @contextmenu.prevent：长按棋盘不该弹出右键菜单；配合下面的
+       user-select/touch-callout，长按也不会选中棋子文字而触发「复制」。 -->
+  <div
+    class="board-wrap"
+    :class="{ 'board-interactive': interactive }"
+    @contextmenu.prevent
+  >
     <svg
       class="xiangqi-board"
       :class="{ flipped }"
@@ -470,8 +476,17 @@ defineExpose({ clearSelection: () => (selected.value = '') })
 <style scoped>
 .board-wrap {
   width: 100%;
-  max-width: 560px;
+  /* 电脑端尽量放大，但棋盘是 9:10 的竖长比例：只放大宽度会把整页顶出滚动条，
+     反而看不见底线。所以宽度上限同时受「左列可用宽度」和「视口高度」约束，
+     取两者的小值 —— 大屏上会明显变大，小屏上仍由列宽决定。 */
+  max-width: max(560px, min(1000px, calc((100vh - 220px) * 0.9)));
   margin: 0 auto;
+  /* 手机长按棋盘：不要弹出系统菜单、不要选中文字、不要触发复制。 */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  /* 去掉移动端的双击缩放延迟，落子手感更跟手。 */
+  touch-action: manipulation;
 }
 
 .xiangqi-board {

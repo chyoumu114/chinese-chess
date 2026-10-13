@@ -58,7 +58,11 @@ type RoomView struct {
 	// DrawOfferedBy names the side with an outstanding draw offer.
 	DrawOfferedBy string `json:"drawOfferedBy,omitempty"`
 	// TakebackRequestedBy names the side asking to undo.
-	TakebackRequestedBy string `json:"takebackRequestedBy,omitempty"`
+	TakebackRequestedBy string `json:"takebackRequestedBy"`
+	// Spectators is how many connections are watching without holding a seat.
+	// The transport layer fills it in: it is the only place that knows about
+	// connections.
+	Spectators int `json:"spectators"`
 }
 
 // RoomResult is the terminal summary stored on a room so that every snapshot

@@ -75,7 +75,19 @@ User 对象：
 
 `GET /api/leaderboard?limit=50` → `{ "users": [ User, ... ] }`
 
-`GET /api/lobby` → `{ "openRooms": [ { "id": 1, "hostName": "alice", "hostSide": "red", "rated": true, "createdAt": "..." } ], "playing": 2 }`
+`GET /api/lobby` → 等待中的房间 + 对局中的房间（后者可以进去观战）：
+
+```json
+{
+  "openRooms": [ { "id": 1, "hostName": "alice", "hostSide": "red", "rated": true, "createdAt": "..." } ],
+  "playingRooms": [ { "id": 2, "redName": "alice", "blackName": "bob", "moveCount": 17,
+                      "rated": true, "spectators": 1, "createdAt": "..." } ],
+  "playing": 2
+}
+```
+
+`playingRooms` 只列出 `status === "playing"` 的房间。`blackName` / `redName` 可能是空字符串：
+一方中途离开后房间仍保留那个空位。`spectators` 是当前观战人数。
 
 `GET /api/users/{id}` → `{ "user": User, "stats": {...}, "games": [ Game, ... ] }`
 
@@ -89,6 +101,15 @@ Game 对象：
   "rated": true, "aiLevel": 0, "createdAt": "...", "startedAt": "...", "finishedAt": "..." }
 ```
 `status` ∈ `waiting` | `playing` | `finished`；`outcome` ∈ `ongoing` | `red_win` | `black_win` | `draw`。
+
+`reason` 取值：`checkmate`、`stalemate`、`king_capture`、`resign`、`timeout`、`draw_agreed`、
+`sixty_move`、`abandoned`，以及三个由**三次重复局面**触发的值：
+
+| reason | 含义 |
+|---|---|
+| `perpetual_check` | 单方长将：同一局面第三次出现且该方每一步都在将军，判该方负 |
+| `perpetual_chase` | 单方长捉：该方每一步都在威胁白吃对方一个无根的车/马/炮，判该方负 |
+| `repetition` | 双方都不变（或都长将、都长捉）：判和 |
 
 `GET /api/games/{id}` → `{ "game": Game }`
 
@@ -133,8 +154,14 @@ Game 对象：
 | `offer_draw` | 无 | 提议和棋。 |
 | `respond_draw` | `{ "accept": true\|false }` | 回应和棋提议。 |
 | `request_takeback` | 无 | 请求悔棋。 |
+
+> **人机对局中电脑一律同意**：`offer_draw` 立即判和（`reason: draw_agreed`，随后下发
+> `game_over`）；`request_takeback` 立即撤销**两个半回合**（电脑的应招 + 玩家自己的着法，
+> 回到玩家落子之前）并下发 `takeback_applied`。之所以撤两步：电脑早就应过招了，只撤一步
+> 等于让它把同一着再走一遍。真人之间仍然是「请求 → 对手回应」的两次往返。
 | `respond_takeback` | `{ "accept": true\|false }` | 回应悔棋请求。 |
 | `chat` | `{ "text": "..." }` | 发送聊天（最多 200 字）。 |
+| `watch` | `{ "roomId": 2 }` | **只观战**：订阅一个房间的更新，不占座位，对局进行中也能用。服务端回 `watching` 与一份 `room` 快照，其中 `youAre` 为空。已坐在另一个未结束房间里时会被拒（`already_seated`）。退出观战用 `leave`，不会判负。 |
 | `sync` | 无 | 请求重发当前房间快照。 |
 | `ping` | 无 | 心跳。 |
 
@@ -156,6 +183,11 @@ Game 对象：
 | `opponent_left` | `{ "roomId": 1, "name": "bob" }`，对方主动离开时额外带 `"left": true` |
 | `left` | `{ "roomId": 1, "dissolved": true }`（回应 `leave`；`dissolved` 表示房间已被解散） |
 | `presence` | `{ "online": [ { "userId": 1, "name": "alice", "roomId": 1, "status": "online"\|"playing"\|"waiting" } ], "rooms": 2 }` |
+
+`status` 取**房间的真实状态**，不是数连接数：`playing` = 该用户所在房间正在对局；`waiting` =
+已入座但还没开局（房间处于 `waiting` 或 `ready`）；`online` = 没有座位（包括只看不下的观众）。
+**同一房间里两个人的状态必须一致**。
+| `watching` | `{ "roomId": 2, "spectating": true }`（回应 `watch`，随后会下发 `room` 快照） |
 | `pong` | 无 |
 
 ### 房间生命周期
@@ -174,6 +206,8 @@ waiting ──第二位玩家入座──▶ ready ──双方都 ready──�
 - `ready`：两个座位都有人，但**必须双方都发 `ready` 才会开始**。`red.ready` / `black.ready`
   让客户端显示“已准备”。
 - `playing`：`legalFrom` 才会下发；被将军的一方只能走解将的着法。
+- 一方在对局中 `leave`（判负结束）后房间会留一个空位：`join { "roomId": N }` 可以补位入座，
+  空位填满后房间回到「等双方 `ready`」的循环。**满座**的 `finished` 房间仍然拒绝加入。
 - `finished`：`result` 出现。双方**不会**自动离开房间，可以再次 `ready` 在同一房间换边再战
   （`resetLocked` 会让红黑座位互换、棋盘重置，并为新对局另建一条 `games` 记录）。
   对手已经离开时，`ready` 会把房间重新放回大厅等待新对手。
@@ -198,7 +232,8 @@ waiting ──第二位玩家入座──▶ ready ──双方都 ready──�
   "youAre": "red",
   "result": { "outcome": "red_win", "reason": "checkmate", "winnerSide": "red", "fen": "...", "moveCount": 42 },
   "drawOfferedBy": "red",
-  "takebackRequestedBy": ""
+  "takebackRequestedBy": "",
+  "spectators": 1
 }
 ```
 
@@ -222,7 +257,8 @@ waiting ──第二位玩家入座──▶ ready ──双方都 ready──�
 
 ### 错误码
 
-`login_required`（未登录）、`room_not_found`、`room_full`、`not_seated`、`not_your_turn`、
+`login_required`（未登录）、`room_not_found`、`room_full`、`already_seated`（已坐在别处，不能观战）、
+`not_seated`、`not_your_turn`、
 `illegal_move`、`no_piece`、`wrong_side`、`finished`、`not_started`、`game_in_progress`、
 `nothing_pending`、`bad_frame`、`bad_payload`、`bad_move`、`unknown_type`、`internal`。
 
@@ -258,4 +294,10 @@ waiting ──第二位玩家入座──▶ ready ──双方都 ready──�
    提和 / 悔棋这类需要对手答复的请求必须足够显眼：收到对方的请求用**模态弹窗**
    让玩家立刻看到并作答（本仓库是 `components/GamePrompt.vue`，挂在应用外壳上，
    在任何页面都能弹出）；自己发出的请求要留下常驻提示，不能只靠几秒就消失的 toast。
-7. **语言**：界面文案用简体中文。
+7. **棋盘交互细节**：棋盘区域要 `user-select: none`、`-webkit-user-select: none`、
+   `-webkit-touch-callout: none`，并在容器上阻止 `contextmenu` —— 手机上长按棋盘不该弹出
+   右键菜单，也不该选中棋子文字而触发「复制」。
+8. **落子反馈**：收到走子（`move_made` 或 `room` 变化）时播放落子音效；页面处于后台标签页时，
+   用标签页标题与**红色图标**闪烁提醒玩家，回到前台立即停止。音效可以直接用 Web Audio 合成，
+   不必引入音频资源。
+9. **语言**：界面文案用简体中文。

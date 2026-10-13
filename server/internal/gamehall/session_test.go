@@ -360,7 +360,7 @@ func TestDrawOfferFlow(t *testing.T) {
 	ctx := context.Background()
 	roomID := mustRoom(t, s, ctx, 1, "alice", 2, "bob")
 
-	side, err := s.OfferDraw(roomID, 1)
+	side, _, err := s.OfferDraw(ctx, roomID, 1)
 	if err != nil {
 		t.Fatalf("offer draw: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestDrawOfferFlow(t *testing.T) {
 	}
 
 	// Now accept for real.
-	if _, err := s.OfferDraw(roomID, 2); err != nil {
+	if _, _, err := s.OfferDraw(ctx, roomID, 2); err != nil {
 		t.Fatalf("second offer: %v", err)
 	}
 	res, err := s.RespondDraw(ctx, roomID, 1, true)
@@ -410,7 +410,7 @@ func TestTakeback(t *testing.T) {
 	if _, err := s.SubmitMove(ctx, roomID, 1, "h7", "e7"); err != nil {
 		t.Fatalf("red move: %v", err)
 	}
-	if _, err := s.RequestTakeback(roomID, 2); err != nil {
+	if _, _, err := s.RequestTakeback(roomID, 2); err != nil {
 		t.Fatalf("request takeback: %v", err)
 	}
 	view, _ := s.View(roomID)

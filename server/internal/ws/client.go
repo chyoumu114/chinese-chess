@@ -57,6 +57,7 @@ func (c *Client) enqueueRoomSnapshot(roomID int64) {
 	if side, found := c.hub.session.SideOfUserIn(roomID, c.identity.UserID); found {
 		view.YouAre = gamehall.SideName(side)
 	}
+	view.Spectators = c.hub.SpectatorCount(roomID)
 	c.enqueue(NewEnvelope(TypeRoom, view))
 }
 
@@ -179,6 +180,14 @@ func (c *Client) handle(env Envelope) {
 			}
 		})
 
+	case TypeWatch:
+		var req WatchRequest
+		if err := env.Decode(&req); err != nil {
+			c.enqueue(NewEnvelope(TypeError, ErrorView{Code: "bad_payload", Message: "观战参数不正确"}))
+			return
+		}
+		c.handleWatch(req)
+
 	case TypeLeave:
 		c.handleLeave(ctx)
 
@@ -204,9 +213,14 @@ func (c *Client) handle(env Envelope) {
 
 	case TypeOfferDraw:
 		c.withRoom(func(roomID int64) {
-			side, err := c.hub.session.OfferDraw(roomID, c.identity.UserID)
+			side, res, err := c.hub.session.OfferDraw(ctx, roomID, c.identity.UserID)
 			if err != nil {
 				c.enqueue(NewEnvelope(TypeError, describeError(err)))
+				return
+			}
+			if res != nil {
+				// 电脑已经同意了：直接公布结果，不必再等一个不会到来的回应。
+				c.hub.announceResult(roomID, res)
 				return
 			}
 			c.hub.sendToRoom(roomID, NewEnvelope(TypeDrawOffered, map[string]any{
@@ -237,9 +251,17 @@ func (c *Client) handle(env Envelope) {
 
 	case TypeRequestTakeback:
 		c.withRoom(func(roomID int64) {
-			side, err := c.hub.session.RequestTakeback(roomID, c.identity.UserID)
+			side, applied, err := c.hub.session.RequestTakeback(roomID, c.identity.UserID)
 			if err != nil {
 				c.enqueue(NewEnvelope(TypeError, describeError(err)))
+				return
+			}
+			if applied != nil {
+				// 电脑已经同意：广播撤子，前端据此回退棋盘。
+				c.hub.sendToRoom(roomID, NewEnvelope(TypeTakebackApplied, map[string]any{"roomId": roomID}))
+				// 撤到「该电脑走」的时候要接着让它走，否则棋盘停在等它应招上：
+				// 玩家不能替它落子，也没人替他走棋。
+				c.hub.requestAIMoveIfNeeded(ctx, roomID)
 				return
 			}
 			c.hub.sendToRoom(roomID, NewEnvelope(TypeTakebackRequested, map[string]any{
@@ -260,6 +282,9 @@ func (c *Client) handle(env Envelope) {
 			}
 			if req.Accept {
 				c.hub.sendToRoom(roomID, NewEnvelope(TypeTakebackApplied, map[string]any{"roomId": roomID}))
+				// 人机对局用不到这条（电脑自己就会同意），但保持两条路径一致：
+				// 撤子后若轮到电脑，同样要把它叫起来。
+				c.hub.requestAIMoveIfNeeded(ctx, roomID)
 			} else {
 				c.hub.sendToRoom(roomID, NewEnvelope(TypeTakebackDeclined, map[string]any{
 					"roomId": roomID, "by": c.identity.Name,
@@ -328,6 +353,38 @@ func aiLevelOf(v int) ai.Level {
 		return 0
 	}
 	return ai.ParseLevel(v)
+}
+
+// handleWatch attaches the caller to a room as a pure spectator. No seat is
+// taken, so the snapshot that comes back carries an empty youAre and the client
+// renders a read-only board.
+//
+// A player may not watch while seated in another unfinished room: a connection
+// holds exactly one room snapshot, so watching would replace the one it is
+// playing on.
+func (c *Client) handleWatch(req WatchRequest) {
+	if req.RoomID == 0 {
+		c.enqueue(NewEnvelope(TypeError, ErrorView{Code: "bad_payload", Message: "缺少房间号"}))
+		return
+	}
+	if _, ok := c.hub.session.RoomByID(req.RoomID); !ok {
+		c.enqueue(NewEnvelope(TypeError, describeError(gamehall.ErrRoomNotFound)))
+		return
+	}
+	if c.identity.UserID != 0 {
+		if seated, ok := c.hub.session.RoomIDForUser(c.identity.UserID); ok && seated != req.RoomID {
+			c.enqueue(NewEnvelope(TypeError, ErrorView{
+				Code: "already_seated", Message: "请先离开当前房间再观战",
+			}))
+			return
+		}
+	}
+	// Watching is exclusive: drop whatever this connection followed before.
+	c.hub.detachAll(c)
+	c.hub.attachRoom(c, req.RoomID)
+	c.enqueue(NewEnvelope(TypeWatching, map[string]any{"roomId": req.RoomID, "spectating": true}))
+	c.enqueueRoomSnapshot(req.RoomID)
+	c.hub.sendPresence()
 }
 
 // handleJoin seats the caller.
@@ -457,6 +514,12 @@ func (c *Client) handleMove(ctx context.Context, roomID int64, req MoveRequest) 
 func (h *Hub) detachClient(c *Client) {
 	h.remove(c)
 	if c.identity.UserID == 0 {
+		h.sendPresence()
+		return
+	}
+	// 同一个账号可能还留着别的连接：刷新页面时新连接通常先建立、旧连接随后才
+	// 断开。这里若直接把座位标成离线，人明明在线上却会显示「· 离线」。
+	if h.hasClientFor(c.identity.UserID) {
 		h.sendPresence()
 		return
 	}

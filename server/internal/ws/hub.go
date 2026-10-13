@@ -176,6 +176,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request, id Identity) {
 		closed:   make(chan struct{}),
 	}
 	h.add(client)
+	// 新连接必须立刻广播一次在线名单：否则刷新页面时新连接没人知道，自己会被
+	// 上一份快照记成「不在线」，要等下一个人加入或离开才纠正过来。
+	h.sendPresence()
 
 	go client.writePump()
 	go client.readPump()
@@ -196,6 +199,20 @@ func (h *Hub) remove(c *Client) {
 		h.detachRoomLocked(c, roomID)
 	}
 	h.mu.Unlock()
+}
+
+// hasClientFor reports whether an account still has a live connection. It is
+// called after the client in question has already been removed, so it only sees
+// the others.
+func (h *Hub) hasClientFor(userID int64) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for other := range h.clients {
+		if other.identity.UserID == userID {
+			return true
+		}
+	}
+	return false
 }
 
 // attachRoom records that a client is watching a room.
@@ -275,36 +292,96 @@ func (h *Hub) sendPresence() {
 	}
 }
 
-// presenceView renders the lobby roster. It reads only the hub's own state and
-// the clients' identities, never the session, so it cannot participate in a
-// lock cycle.
+// presenceView renders the lobby roster.
+//
+// The status must come from the session, never from counting hub connections:
+// counting made two players in the same room disagree — whoever the map loop
+// reached first was reported as "waiting" while the other was "playing" — and a
+// room that is merely ready (both seats taken, nobody has pressed 准备) is
+// "waiting" for both of them, not "playing".
+//
+// Locks are taken one at a time: snapshot the hub, release it, then ask the
+// session. The broadcast worker goes the other way (session hook → hub lock),
+// so holding both here would be a deadlock waiting to happen.
 func (h *Hub) presenceView() PresenceView {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	type connInfo struct {
+		userID int64
+		name   string
+		rooms  []int64
+	}
 
-	view := PresenceView{Online: make([]PresenceEntry, 0, len(h.clients))}
-	rooms := make(map[int64]int)
+	h.mu.RLock()
+	conns := make([]connInfo, 0, len(h.clients))
 	for c := range h.clients {
-		entry := PresenceEntry{UserID: c.identity.UserID, Name: c.identity.Name, Status: "online"}
-		switch len(c.rooms) {
-		case 0:
-			entry.Status = "online"
-		case 1:
-			for id := range c.rooms {
-				entry.RoomID = id
-				rooms[id]++
+		info := connInfo{userID: c.identity.UserID, name: c.identity.Name}
+		for id := range c.rooms {
+			info.rooms = append(info.rooms, id)
+		}
+		conns = append(conns, info)
+	}
+	h.mu.RUnlock()
+
+	view := PresenceView{Online: make([]PresenceEntry, 0, len(conns))}
+	for _, info := range conns {
+		entry := PresenceEntry{UserID: info.userID, Name: info.name, Status: StatusOnline}
+		for _, id := range info.rooms {
+			switch h.presenceStatus(id, info.userID) {
+			case StatusPlaying:
+				entry.RoomID, entry.Status = id, StatusPlaying
+			case StatusWaiting:
+				if entry.Status != StatusPlaying {
+					entry.RoomID, entry.Status = id, StatusWaiting
+				}
 			}
-			entry.Status = "waiting"
-			if rooms[entry.RoomID] > 1 {
-				entry.Status = "playing"
-			}
-		default:
-			entry.Status = "playing"
 		}
 		view.Online = append(view.Online, entry)
 	}
+
+	h.mu.RLock()
 	view.Rooms = len(h.byRoom)
+	h.mu.RUnlock()
 	return view
+}
+
+// presenceStatus maps a room's real state onto one person's lobby status. A
+// spectator holds no seat, so watching does not change that person's status.
+func (h *Hub) presenceStatus(roomID, userID int64) string {
+	r, ok := h.session.RoomByID(roomID)
+	if !ok {
+		return StatusOnline
+	}
+	if _, seated := r.SideOf(userID); !seated {
+		return StatusOnline
+	}
+	switch r.Status {
+	case gamehall.StatusPlaying:
+		return StatusPlaying
+	case gamehall.StatusWaiting, gamehall.StatusReady:
+		return StatusWaiting
+	}
+	return StatusOnline
+}
+
+// SpectatorCount reports how many connections watch a room without holding a
+// seat in it.
+func (h *Hub) SpectatorCount(roomID int64) int {
+	h.mu.RLock()
+	watchers := len(h.byRoom[roomID])
+	h.mu.RUnlock()
+
+	seated := 0
+	if r, ok := h.session.RoomByID(roomID); ok {
+		if r.Red.UserID != 0 {
+			seated++
+		}
+		if r.Black.UserID != 0 {
+			seated++
+		}
+	}
+	if watchers <= seated {
+		return 0
+	}
+	return watchers - seated
 }
 
 // broadcastRoom pushes a fresh snapshot of one room to its watchers. It is

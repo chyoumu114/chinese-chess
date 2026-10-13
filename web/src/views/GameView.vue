@@ -17,8 +17,9 @@ import XiangqiBoard from '../components/XiangqiBoard.vue'
 import GamePanel from '../components/GamePanel.vue'
 import MoveList from '../components/MoveList.vue'
 import { protocol } from '../ws.js'
-import { state, joinRoom, connectRealtime, startFen, toast } from '../store.js'
+import { state, joinRoom, watchRoom, connectRealtime, startFen, toast } from '../store.js'
 import { findKingSquare, resultText, sideLabel } from '../format.js'
+import { playMoveSound, flashTab } from '../notify.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -69,6 +70,9 @@ const youReady = computed(() => !!(mySeat.value && mySeat.value.ready))
 const otherReady = computed(() => !!(otherSeat.value && otherSeat.value.ready))
 
 /** Readiness per side, for the pre-game banner. */
+/** 对手是不是电脑：提和/悔棋的提示文案要跟着变。 */
+const computerOpponent = computed(() => !!(otherSeat.value && otherSeat.value.isAI))
+
 const redReady = computed(() => !!(room.value && room.value.red && room.value.red.ready))
 const blackReady = computed(() => !!(room.value && room.value.black && room.value.black.ready))
 
@@ -191,20 +195,56 @@ const incomingRequest = computed(
 // by installRealtime() in store.js; this view only reads that state, so nothing
 // has to be unsubscribed on unmount.
 
+/**
+ * Enter the room named by the URL. `?watch=1` marks a spectator — the lobby's
+ * 观战 entry adds it — so refreshing a game you are watching never silently
+ * takes a free seat. Everything else enters by seat, which is what lands a
+ * player back on their own seat after a refresh.
+ */
+function enterRoom(id) {
+  if (!id) return
+  if (route.query.watch === '1') watchRoom(id)
+  else joinRoom({ roomId: id })
+}
+
 onMounted(() => {
   connectRealtime()
   const id = Number(route.params.id || 0)
-  // Only re-seat when we are not already looking at that exact room.
-  if (id && (!state.room || state.room.id !== id)) {
-    joinRoom({ roomId: id })
+  if (id) {
+    // Only re-enter when we are not already looking at that exact room.
+    if (!state.room || state.room.id !== id) enterRoom(id)
+    return
   }
+  // No room in the URL and none shared: there is nothing to render, so go back
+  // to the lobby instead of parking on an empty page.
+  if (!state.room) router.replace('/lobby')
 })
 
 watch(
   () => route.params.id,
   (raw) => {
     const id = Number(raw || 0)
-    if (id && (!state.room || state.room.id !== id)) joinRoom({ roomId: id })
+    if (id && (!state.room || state.room.id !== id)) enterRoom(id)
+  }
+)
+
+// Leaving a room clears the shared snapshot. The player wants the lobby at that
+// point, not a leftover "尚未入座" page.
+watch(
+  () => state.room,
+  (value, previous) => {
+    if (!value && previous) router.replace('/lobby')
+  }
+)
+
+// A piece moved: play the knock, and if the page is in a background tab make the
+// tab itself flash red until the player comes back.
+watch(
+  () => state.lastMove,
+  (value) => {
+    if (!value) return
+    playMoveSound()
+    flashTab('轮到你了 · 中国象棋')
   }
 )
 
@@ -233,12 +273,13 @@ function onResign() {
 
 function onOfferDraw() {
   protocol.offerDraw()
-  toast('已提议和棋，等待对手回应', 'info')
+  // 人机对战里电脑会立刻同意，提示「等待对手回应」会误导。
+  toast(computerOpponent.value ? '电脑同意和棋' : '已提议和棋，等待对手回应', 'info')
 }
 
 function onRequestTakeback() {
   protocol.requestTakeback()
-  toast('已请求悔棋，等待对手回应', 'info')
+  toast(computerOpponent.value ? '电脑同意悔棋，已退回你落子之前' : '已请求悔棋，等待对手回应', 'info')
 }
 
 function onRespondDraw(accept) {
@@ -276,11 +317,35 @@ function backToLobby() {
 }
 
 /**
+ * A spectator looking at a room with a free seat may take it. That is how the
+ * lobby's 「对战中」 list turns into a replacement player once somebody walks
+ * out: the room keeps its position and offers the empty seat.
+ */
+const openSeat = computed(() => {
+  const r = room.value
+  if (!r || youAre.value) return ''
+  if (!r.red || !r.red.userId) return 'red'
+  if (!r.black || !r.black.userId) return 'black'
+  return ''
+})
+
+function onTakeSeat() {
+  if (!room.value) return
+  joinRoom({ roomId: room.value.id })
+}
+
+/**
  * Leaving is always available: it cancels a quick match, and it forfeits a game
  * in progress (which is the only way to walk out of one). The server answers
  * with a `left` frame, which clears the shared snapshot.
  */
 function onLeave() {
+  // A spectator holds no seat: leaving neither forfeits nor dissolves anything,
+  // so it needs no scary confirmation.
+  if (!youAre.value) {
+    if (!protocol.leave()) toast('连接已断开，请稍后重试', 'error')
+    return
+  }
   const playing = status.value === 'playing'
   const question = playing
     ? '对局尚未结束，离开将判负。确定离开房间吗？'
@@ -293,55 +358,63 @@ function onLeave() {
 </script>
 
 <template>
+  <!-- 没有房间快照只是转场：离开房间后会立刻被送回大厅，这里不留落脚的页面。 -->
   <div v-if="!room" class="card not-in-room">
-    <h2>尚未入座</h2>
-    <p class="muted">你当前不在任何对局中。请到大厅选择房间、快速匹配或开始人机对战。</p>
-    <div class="btn-row">
-      <button class="btn btn-primary" @click="backToLobby">前往大厅</button>
-    </div>
+    <p class="muted">正在进入房间…</p>
   </div>
 
   <div v-else class="game-layout">
     <div class="side-column board-column">
-      <div v-if="finished" :class="bannerClass">
-        <div class="banner-main">{{ bannerText }}</div>
-        <div class="banner-sub">{{ bannerSub }} · 共 {{ moveCount }} 着</div>
-      </div>
+      <!--
+        提示区高度是固定的（见 .board-notices）：将军、准备、等待这些提示出现或消失
+        时，棋盘不能被顶着上下移动。下棋的人对棋盘位置很敏感，挪 20px 也会觉得
+        「棋盘在跳」。没有提示时这里放一句状态行，免得留一个空洞。
+      -->
+      <div class="board-notices">
+        <div v-if="finished" :class="bannerClass">
+          <div class="banner-main">{{ bannerText }}</div>
+          <div class="banner-sub">{{ bannerSub }} · 共 {{ moveCount }} 着</div>
+        </div>
 
-      <!-- 被将军的提示要显眼：被将军时只能走能解将的着法。 -->
-      <div v-else-if="room.inCheck" class="check-alert" :class="{ 'check-alert-mine': iAmChecked }">
-        <span class="check-alert-icon" aria-hidden="true">将</span>
-        <div>
-          <div class="check-alert-title">
-            {{ sideLabel(room.turn) }}被将军！{{ iAmChecked ? '必须应将' : '只能应将' }}
-          </div>
-          <div class="check-alert-sub">
-            <template v-if="iAmChecked">只能走解将的着法（吃掉将军的子、垫将、或走将），送将无效。</template>
-            <template v-else>对手必须走解将的着法，送将无效。</template>
+        <!-- 被将军的提示要显眼：被将军时只能走能解将的着法。 -->
+        <div v-else-if="room.inCheck" class="check-alert" :class="{ 'check-alert-mine': iAmChecked }">
+          <span class="check-alert-icon" aria-hidden="true">将</span>
+          <div>
+            <div class="check-alert-title">
+              {{ sideLabel(room.turn) }}被将军！{{ iAmChecked ? '必须应将' : '只能应将' }}
+            </div>
+            <div class="check-alert-sub">
+              <template v-if="iAmChecked">只能走解将的着法（吃掉将军的子、垫将、或走将），送将无效。</template>
+              <template v-else>对手必须走解将的着法，送将无效。</template>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div v-else-if="status === 'waiting'" class="banner banner-info">
-        等待对手加入…把房间号告诉朋友，或在大厅等待自动匹配
-      </div>
-
-      <!-- 准备阶段：双方都点了准备才开始。 -->
-      <div v-else-if="status === 'ready'" class="ready-banner">
-        <div class="ready-line">
-          <span class="ready-side" :class="{ on: redReady }">红方{{ redReady ? '已准备' : '未准备' }}</span>
-          <span class="ready-vs">VS</span>
-          <span class="ready-side" :class="{ on: blackReady }">黑方{{ blackReady ? '已准备' : '未准备' }}</span>
+        <div v-else-if="status === 'waiting'" class="banner banner-info">
+          等待对手加入…把房间号告诉朋友，或在大厅等待自动匹配
         </div>
-        <div class="ready-hint">{{ readyHint }}</div>
-      </div>
 
-      <!-- 一方的提和/悔棋请求还没答复时要一直看得见。 -->
-      <div v-if="!incomingRequest && myPendingDraw" class="banner banner-pending">
-        你已提议和棋，等待对手回应…
-      </div>
-      <div v-else-if="!incomingRequest && myPendingTakeback" class="banner banner-pending">
-        你已请求悔棋，等待对手回应…
+        <!-- 准备阶段：双方都点了准备才开始。 -->
+        <div v-else-if="status === 'ready'" class="ready-banner">
+          <div class="ready-line">
+            <span class="ready-side" :class="{ on: redReady }">红方{{ redReady ? '已准备' : '未准备' }}</span>
+            <span class="ready-vs">VS</span>
+            <span class="ready-side" :class="{ on: blackReady }">黑方{{ blackReady ? '已准备' : '未准备' }}</span>
+          </div>
+          <div class="ready-hint">{{ readyHint }}</div>
+        </div>
+
+        <div v-else class="banner banner-idle">
+          对局进行中 · 轮到{{ sideLabel(room.turn) }}
+        </div>
+
+        <!-- 一方的提和/悔棋请求还没答复时要一直看得见。 -->
+        <div v-if="!incomingRequest && myPendingDraw" class="banner banner-pending">
+          你已提议和棋，等待对手回应…
+        </div>
+        <div v-else-if="!incomingRequest && myPendingTakeback" class="banner banner-pending">
+          你已请求悔棋，等待对手回应…
+        </div>
       </div>
 
       <div class="board-card card">
@@ -352,7 +425,7 @@ function onLeave() {
           <span v-if="youAre" class="badge" :class="youAre === 'red' ? 'badge-red' : 'badge-black'">
             你执{{ sideLabel(youAre) }}
           </span>
-          <span v-else class="badge">旁观</span>
+          <span v-else class="badge">观战中</span>
         </div>
 
         <XiangqiBoard
@@ -411,9 +484,19 @@ function onLeave() {
           匹配中：可以点「解散房间」取消匹配。
         </p>
 
+        <!-- 观众：一方的座位空出来就能补位接着下。 -->
+        <template v-if="!youAre">
+          <p class="muted ready-card-hint">
+            你在观战。{{ openSeat ? '这一桌有空位，可以入座加入棋局。' : '等一方离开后会出现空位。' }}
+          </p>
+          <button v-if="openSeat" class="btn btn-primary ready-btn" @click="onTakeSeat">
+            入座（{{ sideLabel(openSeat) }}）
+          </button>
+        </template>
+
         <div class="btn-row">
           <button class="btn btn-danger" @click="onLeave">
-            {{ status === 'waiting' ? '解散房间' : '离开房间' }}
+            {{ !youAre ? '停止观战' : status === 'waiting' ? '解散房间' : '离开房间' }}
           </button>
           <button class="btn" @click="backToLobby">返回大厅</button>
         </div>
@@ -469,6 +552,44 @@ function onLeave() {
 
 .board-column {
   gap: 10px;
+  /* 侧栏内容再长也不能反向撑宽这一列，否则棋盘会跟着缩放。 */
+  min-width: 0;
+}
+
+/* 右侧栏拉到与左列（棋盘那一列）等高：底边对齐，视觉上不再参差。
+   多出来的高度交给最后一个卡片（聊天），它的滚动区跟着变高。 */
+.side-column:last-child {
+  align-self: stretch;
+  min-height: 0;
+}
+
+.side-column:last-child > .card:last-child {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.side-column:last-child > .card:last-child .chat-box {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 180px;
+}
+
+/* 提示区：无论有没有提示都占同样的高度，棋盘因此不会上下移动。
+   112px 是按最长的一种组合留的（准备面板 ≈74px + 一行待回应提示 ≈46px 会略超，
+   所以下面用 flex 让它自然排布，超出时也只是轻微增长）。 */
+.board-notices {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 112px;
+}
+
+/* 没有提示时的常驻状态行，避免固定高度变成一块空白。 */
+.banner-idle {
+  background: #f7f2e8;
+  border: 1px solid var(--border-soft);
+  color: var(--text-muted);
+  font-weight: 400;
 }
 
 .board-card {

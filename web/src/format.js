@@ -18,7 +18,11 @@ const REASON_LABEL = {
   timeout: '超时',
   draw_agreed: '协议和棋',
   sixty_move: '六十回合无吃子',
-  abandoned: '对手离开'
+  abandoned: '对手离开',
+  // 三次重复局面：单方连续将军/捉子判负，双方都不变判和。
+  perpetual_check: '长将判负',
+  perpetual_chase: '长捉判负',
+  repetition: '三次重复判和'
 }
 
 const STATUS_LABEL = {

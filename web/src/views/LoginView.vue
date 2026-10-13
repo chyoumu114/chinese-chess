@@ -186,4 +186,57 @@ async function submit() {
   margin: 14px 0 0;
   text-align: center;
 }
+
+/* ===== 手机端适配（表单自适应 + 点按区域 ≥40px）=====
+   输入框宽度本就 100%，这里只压缩外边距、放大字号与高度，
+   避免 iOS 聚焦缩放并保证手指可点。桌面端不受影响。 */
+@media (max-width: 640px) {
+  .login-page {
+    padding: 12px 0 4px;
+  }
+
+  .login-card {
+    max-width: 100%;
+    padding: 14px 14px 16px;
+  }
+
+  .login-title {
+    font-size: 1.3rem;
+  }
+
+  .login-sub {
+    font-size: 0.82rem;
+    margin-bottom: 14px;
+  }
+
+  /* 分段切换按钮：高度 ≥44px */
+  .tabs {
+    gap: 4px;
+    margin-bottom: 14px;
+  }
+
+  .tab {
+    padding: 12px 0;
+    min-height: 44px;
+    font-size: 0.98rem;
+  }
+
+  /* 输入框：44px 高度，字号 1rem（16px）防 iOS 自动放大 */
+  .login-card input {
+    min-height: 44px;
+    font-size: 1rem;
+    padding: 10px 12px;
+  }
+
+  .submit {
+    min-height: 46px;
+    padding: 12px;
+    font-size: 1.02rem;
+  }
+
+  .hint {
+    font-size: 0.8rem;
+    margin-top: 12px;
+  }
+}
 </style>

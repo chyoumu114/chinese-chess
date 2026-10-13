@@ -204,9 +204,33 @@ func (s *Server) handleLobby(w http.ResponseWriter, r *http.Request) {
 			Rated: o.Rated, CreatedAt: o.CreatedAt,
 		})
 	}
+	// 对局中的房间：任何人都可以进去观战，所以大厅要把它们列出来。
+	type playingRoom struct {
+		ID         int64     `json:"id"`
+		RedName    string    `json:"redName"`
+		BlackName  string    `json:"blackName"`
+		MoveCount  int       `json:"moveCount"`
+		Rated      bool      `json:"rated"`
+		Spectators int       `json:"spectators"`
+		CreatedAt  time.Time `json:"createdAt"`
+	}
+	playing := s.session.PlayingRooms()
+	ongoing := make([]playingRoom, 0, len(playing))
+	for _, p := range playing {
+		spectators := 0
+		if s.hub != nil {
+			spectators = s.hub.SpectatorCount(p.ID)
+		}
+		ongoing = append(ongoing, playingRoom{
+			ID: p.ID, RedName: p.RedName, BlackName: p.BlackName,
+			MoveCount: p.MoveCount, Rated: p.Rated,
+			Spectators: spectators, CreatedAt: p.CreatedAt,
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"openRooms": rooms,
-		"playing":   len(s.session.RoomIDs()),
+		"openRooms":    rooms,
+		"playingRooms": ongoing,
+		"playing":      len(s.session.RoomIDs()),
 	})
 }
 

@@ -28,7 +28,9 @@ const displayName = computed(() => {
   return state.user.nickname || state.user.username || ''
 })
 
-const inRoom = computed(() => !!(state.room && state.room.id))
+// 「你正在对局中」只针对真正坐在座位上的自己：观战时 state.room 同样有值，
+// 但那是别人的对局，不该冒出这条常驻横幅。
+const inRoom = computed(() => !!(state.room && state.room.id && state.room.youAre))
 
 function doSignOut() {
   signOut()
@@ -58,7 +60,7 @@ function backToGame() {
 
         <div class="header-right">
           <span class="conn" :class="`conn-${state.connection}`" :title="connLabel">
-            <span class="conn-dot" />{{ connLabel }}
+            <span class="conn-dot" /><span class="conn-text">{{ connLabel }}</span>
           </span>
           <template v-if="state.user">
             <span class="who">{{ displayName }}</span>
@@ -217,5 +219,96 @@ function backToGame() {
   font-size: 0.8rem;
   padding: 18px;
   border-top: 1px solid var(--border);
+}
+
+/* ===== 手机端适配（导航栏不溢出）=====
+   窄屏下顶部栏改为两行：第一行 品牌 + 账户区，第二行 导航（可换行）。
+   桌面端（>=1024px）不进入任何媒体查询，视觉不变。 */
+@media (max-width: 640px) {
+  .app-header-inner {
+    padding: 8px 12px;
+    gap: 8px 10px;
+  }
+
+  /* 品牌是唯一可压缩项：空间不足时文本省略号，绝不撑破一行 */
+  .brand {
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+
+  .brand-mark {
+    width: 28px;
+    height: 28px;
+    font-size: 1rem;
+    flex: none;
+  }
+
+  .brand-text {
+    font-size: 0.92rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 导航换到第二行，独占整行；顺序在账户区之后 */
+  .nav {
+    order: 3;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    gap: 2px;
+  }
+
+  .nav a {
+    padding: 7px 10px;
+    font-size: 0.88rem;
+  }
+
+  .header-right {
+    margin-left: auto;
+    flex: none;
+    gap: 8px;
+  }
+
+  .conn {
+    font-size: 0.76rem;
+    white-space: nowrap;
+    min-width: 0;
+  }
+
+  /* 长昵称截断，避免把连接状态与退出按钮挤出行外 */
+  .who {
+    font-size: 0.84rem;
+    max-width: 4.5em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .resume-bar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 12px;
+    text-align: center;
+  }
+
+  .app-main {
+    padding: 12px 12px 32px;
+  }
+
+  .app-footer {
+    padding: 14px 12px;
+    font-size: 0.76rem;
+  }
+}
+
+/* 比目标机型（360px）更窄时：连接状态只留颜色圆点，title 仍带完整文案 */
+@media (max-width: 359px) {
+  .conn-text {
+    display: none;
+  }
+
+  .brand-text {
+    font-size: 0.85rem;
+  }
 }
 </style>

@@ -34,6 +34,9 @@ const (
 	TypeChat = "chat"
 	// TypeSync asks the server to resend the full room state.
 	TypeSync = "sync"
+	// TypeWatch attaches the caller to a room as a pure spectator. Unlike join
+	// it never takes a seat, so it works on a game already under way.
+	TypeWatch = "watch"
 	// TypePing is an application-level keepalive.
 	TypePing = "ping"
 )
@@ -70,6 +73,8 @@ const (
 	TypePong = "pong"
 	// TypePresence lists who is online in the lobby.
 	TypePresence = "presence"
+	// TypeWatching acknowledges that the caller now follows a room.
+	TypeWatching = "watching"
 )
 
 // Envelope is the outer frame of every message in both directions.
@@ -144,6 +149,19 @@ type WelcomeView struct {
 	Guest    bool   `json:"guest"`
 	RoomID   int64  `json:"roomId,omitempty"`
 	ServerAt int64  `json:"serverAt"`
+}
+
+// 在线状态：大厅里每个人的三种状态，前端按这个字符串渲染。
+const (
+	StatusOnline  = "online"
+	StatusWaiting = "waiting"
+	StatusPlaying = "playing"
+)
+
+// WatchRequest is the payload of a watch message.
+type WatchRequest struct {
+	// RoomID is the room to follow. A zero value is rejected.
+	RoomID int64 `json:"roomId"`
 }
 
 // PresenceEntry lists one online player.

@@ -136,6 +136,22 @@ func negamax(g *game.Game, depth, alpha, beta int, deadline time.Time) int {
 		// The side to move has lost: mated, stalemated or its king is gone.
 		return -mateScore - depth
 	}
+	// A threefold repetition carries its own verdict: whoever kept checking or
+	// chasing loses, anything else is a draw. Searching it here is what stops the
+	// computer from shuffling into a perpetual check and losing to a rule it
+	// otherwise never sees. Without this the search actively likes repeated
+	// checks, because each one looks like a free tempo.
+	if v := g.Repetition(); v.Decided {
+		if v.Outcome == game.OutcomeDraw {
+			return 0
+		}
+		// The loser is normally the side that just moved, i.e. the opponent of
+		// the side to move here.
+		if v.Loser == g.Turn() {
+			return -mateScore - depth
+		}
+		return mateScore + depth
+	}
 	if depth <= 0 || time.Now().After(deadline) {
 		return evaluate(g)
 	}

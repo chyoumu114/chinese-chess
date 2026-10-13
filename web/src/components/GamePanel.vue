@@ -87,6 +87,9 @@ function seatClass(side) {
 
 function displayName(player) {
   if (!player) return '虚位以待'
+  // 座位空出来以后端不带名字、也没有 userId：那是空位，不是某个匿名玩家。
+  // 一方离开判负后，这里必须腾出来给下一个进来的人。
+  if (!player.userId && !player.isAI) return '虚位以待'
   const name = player.name || '（匿名）'
   // The server labels the computer opponent with the engine's level key
   // ("电脑（easy）"); show the Chinese level name instead.

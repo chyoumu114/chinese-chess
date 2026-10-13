@@ -213,6 +213,10 @@ export const protocol = {
   requestTakeback: () => ws.send('request_takeback'),
   respondTakeback: (accept) => ws.send('respond_takeback', { accept: !!accept }),
   chat: (text) => ws.send('chat', { text }),
+  // watch enters a running game as a pure spectator: no seat is taken, so the
+  // `room` snapshot the server answers with carries an empty `youAre`. The
+  // existing `leave` is what stops watching.
+  watchRoom: (roomId) => ws.send('watch', { roomId }),
   sync: () => ws.send('sync')
 }
 

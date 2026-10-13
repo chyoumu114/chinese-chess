@@ -503,6 +503,339 @@ func (c *checker) run() error {
 
 	// 14. A student of the lobby sees the waiting room while one exists.
 	c.logf("✓ lobby and leaderboard reachable: %v", c.checkLobby(alice.Token))
+
+	// 15. 观战与补位：第三方只看不下，一方离开后补上那个空位。
+	if err := c.checkSpectating(); err != nil {
+		return err
+	}
+
+	// 16. 刷新页面不能被误判成掉线。
+	if err := c.checkRefreshKeepsSeatOnline(); err != nil {
+		return err
+	}
+
+	// 17. 人机对战：提和与悔棋都由电脑当场同意。
+	if err := c.checkAIConsent(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkAIConsent 验证人机对战时电脑自动同意提和与悔棋。这一项走真实 WebSocket 与
+// 真实的 AI worker，所以也顺带覆盖了「电脑自己会走棋」这条链路。
+func (c *checker) checkAIConsent() error {
+	suffix := time.Now().UnixNano() % 1_000_000
+	human, err := c.register(fmt.Sprintf("human%d", suffix), "人机玩家")
+	if err != nil {
+		return c.fail("register human: %w", err)
+	}
+	conn, err := c.dial(human.Token, "human")
+	if err != nil {
+		return c.fail("dial human: %w", err)
+	}
+	defer conn.close()
+
+	// 提和：电脑立即同意，直接回 game_over。
+	if err := conn.send("join", map[string]any{"aiLevel": 1, "rated": false}); err != nil {
+		return c.fail("join computer game: %w", err)
+	}
+	if _, err := conn.waitForStatus("playing", 10*time.Second); err != nil {
+		return c.fail("the computer game did not start: %w", err)
+	}
+	if err := conn.send("offer_draw", nil); err != nil {
+		return c.fail("offer draw: %w", err)
+	}
+	over, err := conn.waitFor("game_over", 10*time.Second)
+	if err != nil {
+		return c.fail("提和后没有立刻收到结果: %w", err)
+	}
+	if over.GameOver.Outcome != "draw" {
+		return c.fail("提和后 outcome = %q, want draw", over.GameOver.Outcome)
+	}
+	c.logf("✓ 人机对战：提和后电脑立即同意，判和")
+
+	// 悔棋：换一局，人走一步、电脑应一步，再请求悔棋。
+	if err := conn.send("join", map[string]any{"aiLevel": 1, "rated": false}); err != nil {
+		return c.fail("second computer game: %w", err)
+	}
+	second, err := conn.waitForStatus("playing", 15*time.Second)
+	if err != nil {
+		return c.fail("the second computer game did not start: %w", err)
+	}
+	roomID := second.Room.ID
+
+	if err := conn.send("move", map[string]any{"from": "h7", "to": "e7"}); err != nil {
+		return c.fail("human move: %w", err)
+	}
+	if _, err := conn.waitFor("move_made", 10*time.Second); err != nil {
+		return c.fail("human move was not acknowledged: %w", err)
+	}
+	// 电脑自己应一手：这一步由服务端的 AI worker 完成。
+	if _, err := conn.waitFor("move_made", 25*time.Second); err != nil {
+		return c.fail("the computer did not answer: %w", err)
+	}
+
+	if err := conn.send("request_takeback", nil); err != nil {
+		return c.fail("request takeback: %w", err)
+	}
+	if _, err := conn.waitFor("takeback_applied", 10*time.Second); err != nil {
+		return c.fail("悔棋没有被电脑同意: %w", err)
+	}
+	if err := conn.send("sync", nil); err != nil {
+		return c.fail("sync: %w", err)
+	}
+	view, err := conn.waitForRoomWhere(10*time.Second, func(r roomSnapshot) bool {
+		return r.ID == roomID && r.Status == "playing"
+	})
+	if err != nil {
+		return c.fail("snapshot after takeback: %w", err)
+	}
+	if len(view.Room.Moves) != 0 {
+		return c.fail("悔棋后应当退回玩家落子之前（0 着），实际 %d 着", len(view.Room.Moves))
+	}
+	c.logf("✓ 人机对战：悔棋后电脑同意，局面退回玩家落子之前")
+
+	// 执黑时电脑先行：撤掉它那一步之后，必须由它接着走，否则棋盘停在「等电脑」上，
+	// 玩家既不能替它落子、也没人应招。
+	//
+	// 先离开上一局：带着 aiLevel 的 join 在已有对局时是「回到原座位」，不会新开一局，
+	// 不离开就换不成黑方。
+	if err := conn.send("leave", nil); err != nil {
+		return c.fail("leave before the black game: %w", err)
+	}
+	if _, err := conn.waitFor("left", 10*time.Second); err != nil {
+		return c.fail("no left acknowledgement: %w", err)
+	}
+	if err := conn.send("join", map[string]any{"aiLevel": 1, "rated": false, "side": "black"}); err != nil {
+		return c.fail("join as black: %w", err)
+	}
+	third, err := conn.waitForStatus("playing", 15*time.Second)
+	if err != nil {
+		return c.fail("the game as black did not start: %w", err)
+	}
+	roomID = third.Room.ID
+	if third.Room.YouAre != "black" {
+		return c.fail("应当执黑，得到 %q", third.Room.YouAre)
+	}
+	if _, err := conn.waitFor("move_made", 25*time.Second); err != nil {
+		return c.fail("执黑时电脑没有先走: %w", err)
+	}
+
+	if err := conn.send("request_takeback", nil); err != nil {
+		return c.fail("request takeback as black: %w", err)
+	}
+	if _, err := conn.waitFor("takeback_applied", 10*time.Second); err != nil {
+		return c.fail("执黑悔棋没有被同意: %w", err)
+	}
+	if _, err := conn.waitFor("move_made", 25*time.Second); err != nil {
+		return c.fail("悔棋后轮到电脑走，但它没有接着走（棋盘会卡死）: %w", err)
+	}
+	c.logf("✓ 人机对战执黑：悔棋后电脑接着走，棋盘不会卡死")
+	return nil
+}
+
+// checkRefreshKeepsSeatOnline 验证「刷新页面」不会把座位标成离线。
+//
+// 刷新的时序是：新连接先建立（回到座位），旧连接随后才被服务端察觉关闭。若旧连接
+// 一断就把座位标成离线，人明明在线上，对面看到的却是「· 离线」。
+func (c *checker) checkRefreshKeepsSeatOnline() error {
+	suffix := time.Now().UnixNano() % 1_000_000
+	fresher, err := c.register(fmt.Sprintf("fresher%d", suffix), "刷新的人")
+	if err != nil {
+		return c.fail("register fresher: %w", err)
+	}
+	peer, err := c.register(fmt.Sprintf("peer%d", suffix), "对面的")
+	if err != nil {
+		return c.fail("register peer: %w", err)
+	}
+
+	old, err := c.dial(fresher.Token, "fresher-old")
+	if err != nil {
+		return c.fail("dial fresher old: %w", err)
+	}
+	defer old.close()
+	peerConn, err := c.dial(peer.Token, "peer")
+	if err != nil {
+		return c.fail("dial peer: %w", err)
+	}
+	defer peerConn.close()
+
+	if err := old.send("join", map[string]any{"rated": false}); err != nil {
+		return c.fail("fresher join: %w", err)
+	}
+	seat, err := old.waitForStatus("waiting", 10*time.Second)
+	if err != nil {
+		return c.fail("fresher room: %w", err)
+	}
+	roomID := seat.Room.ID
+
+	if err := peerConn.send("join", map[string]any{"roomId": roomID}); err != nil {
+		return c.fail("peer join: %w", err)
+	}
+	if _, err := peerConn.waitForStatus("ready", 10*time.Second); err != nil {
+		return c.fail("peer ready state: %w", err)
+	}
+	if err := old.send("ready", nil); err != nil {
+		return c.fail("fresher ready: %w", err)
+	}
+	if err := peerConn.send("ready", nil); err != nil {
+		return c.fail("peer ready: %w", err)
+	}
+	if _, err := peerConn.waitForStatus("playing", 10*time.Second); err != nil {
+		return c.fail("the game did not start: %w", err)
+	}
+
+	// 「刷新」：新连接先上来并回到同一个座位，旧连接随后关闭。
+	fresh, err := c.dial(fresher.Token, "fresher-new")
+	if err != nil {
+		return c.fail("dial fresher new: %w", err)
+	}
+	defer fresh.close()
+	if err := fresh.send("join", map[string]any{"roomId": roomID}); err != nil {
+		return c.fail("fresher rejoin: %w", err)
+	}
+	if _, err := fresh.waitForRoomWhere(10*time.Second, func(r roomSnapshot) bool {
+		return r.YouAre != ""
+	}); err != nil {
+		return c.fail("the new connection did not get the seat back: %w", err)
+	}
+	old.close()
+
+	// 服务端处理旧连接的关闭是毫秒级的；这里连续追一秒，确认座位始终在线。
+	// 用 100ms 的轮询只是取样的节奏，不是在等一个猜出来的时间点。
+	for i := 0; i < 10; i++ {
+		if err := peerConn.send("sync", nil); err != nil {
+			return c.fail("peer sync: %w", err)
+		}
+		view, err := peerConn.waitForRoomWhere(5*time.Second, func(r roomSnapshot) bool {
+			return r.Status == "playing"
+		})
+		if err != nil {
+			return c.fail("peer snapshot: %w", err)
+		}
+		if !seatIsOnline(view.Room, fresher.User.ID) {
+			return c.fail("刷新后座位被标成离线（第 %d 次检查）", i+1)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	c.logf("✓ 刷新页面后座位始终显示在线（旧连接关闭后连续 1 秒确认）")
+	return nil
+}
+
+// seatIsOnline reports whether the given account's seat is marked online.
+func seatIsOnline(r roomSnapshot, userID int64) bool {
+	for _, seat := range []seatSnapshot{r.Red, r.Black} {
+		if seat.UserID == userID {
+			return seat.Online
+		}
+	}
+	return false
+}
+
+// checkSpectating 验证观战这条链路：
+//
+//	两个新账号入座并开局 → 第三个账号用 watch 只观不下（不占座位）→ 一方离开判负后
+//	房间保留空位 → 观战者用 join 补上空位。
+func (c *checker) checkSpectating() error {
+	suffix := time.Now().UnixNano() % 1_000_000
+	host, err := c.register(fmt.Sprintf("host%d", suffix), "房主")
+	if err != nil {
+		return c.fail("register host: %w", err)
+	}
+	guest, err := c.register(fmt.Sprintf("guest%d", suffix), "客人")
+	if err != nil {
+		return c.fail("register guest: %w", err)
+	}
+	watcher, err := c.register(fmt.Sprintf("watch%d", suffix), "观众")
+	if err != nil {
+		return c.fail("register watcher: %w", err)
+	}
+
+	hostConn, err := c.dial(host.Token, "host")
+	if err != nil {
+		return c.fail("dial host: %w", err)
+	}
+	defer hostConn.close()
+	guestConn, err := c.dial(guest.Token, "guest")
+	if err != nil {
+		return c.fail("dial guest: %w", err)
+	}
+	defer guestConn.close()
+	watchConn, err := c.dial(watcher.Token, "watcher")
+	if err != nil {
+		return c.fail("dial watcher: %w", err)
+	}
+	defer watchConn.close()
+
+	// 开一桌并开局。
+	if err := hostConn.send("join", map[string]any{"rated": false}); err != nil {
+		return c.fail("host join: %w", err)
+	}
+	hostRoom, err := hostConn.waitForStatus("waiting", 10*time.Second)
+	if err != nil {
+		return c.fail("host room: %w", err)
+	}
+	roomID := hostRoom.Room.ID
+
+	if err := guestConn.send("join", map[string]any{"roomId": roomID}); err != nil {
+		return c.fail("guest join: %w", err)
+	}
+	if _, err := guestConn.waitForStatus("ready", 10*time.Second); err != nil {
+		return c.fail("guest did not reach ready: %w", err)
+	}
+	if err := hostConn.send("ready", nil); err != nil {
+		return c.fail("host ready: %w", err)
+	}
+	if err := guestConn.send("ready", nil); err != nil {
+		return c.fail("guest ready: %w", err)
+	}
+	if _, err := hostConn.waitForStatus("playing", 10*time.Second); err != nil {
+		return c.fail("the game did not start: %w", err)
+	}
+	c.logf("✓ 观战用的房间 %d 已开局", roomID)
+
+	// 第三方 watch：不占座，快照的 youAre 必须为空。
+	if err := watchConn.send("watch", map[string]any{"roomId": roomID}); err != nil {
+		return c.fail("send watch: %w", err)
+	}
+	if _, err := watchConn.waitFor("watching", 10*time.Second); err != nil {
+		return c.fail("no watching acknowledgement: %w", err)
+	}
+	watched, err := watchConn.waitForStatus("playing", 10*time.Second)
+	if err != nil {
+		return c.fail("the spectator got no snapshot: %w", err)
+	}
+	if watched.Room.YouAre != "" {
+		return c.fail("观战快照的 youAre 应为空，得到 %q", watched.Room.YouAre)
+	}
+	if watched.Room.Red.UserID == 0 || watched.Room.Black.UserID == 0 {
+		return c.fail("观战不该占座：red=%d black=%d", watched.Room.Red.UserID, watched.Room.Black.UserID)
+	}
+	c.logf("✓ 第三方可以只观不下：youAre 为空、座位未被占用")
+
+	// 一方离开判负，房间留下一个空位。
+	if err := hostConn.send("leave", nil); err != nil {
+		return c.fail("host leave: %w", err)
+	}
+	if _, err := watchConn.waitForRoomWhere(10*time.Second, func(r roomSnapshot) bool {
+		return r.Status == "finished"
+	}); err != nil {
+		return c.fail("离开后房间未结束: %w", err)
+	}
+	c.logf("✓ 一方离开后房间保留空位")
+
+	// 观战者补位入座。
+	if err := watchConn.send("join", map[string]any{"roomId": roomID}); err != nil {
+		return c.fail("watcher join: %w", err)
+	}
+	taken, err := watchConn.waitForRoomWhere(10*time.Second, func(r roomSnapshot) bool {
+		return r.YouAre != "" &&
+			(r.Red.UserID == watcher.User.ID || r.Black.UserID == watcher.User.ID)
+	})
+	if err != nil {
+		return c.fail("观战者补位失败: %w", err)
+	}
+	c.logf("✓ 观战者补上空位，现在执 %s", taken.Room.YouAre)
 	return nil
 }
 

@@ -167,7 +167,7 @@ function closeReplay() {
       <p v-if="listError" class="form-error">{{ listError }}</p>
       <p v-else-if="!games.length && !loading" class="empty">还没有已结束的对局。</p>
 
-      <table v-else class="table">
+      <table v-else class="table table-cards">
         <thead>
           <tr>
             <th>编号</th>
@@ -186,10 +186,10 @@ function closeReplay() {
             :class="{ selected: selected && selected.id === g.id }"
             @click="openGame(g.id)"
           >
-            <td class="num">#{{ g.id }}</td>
-            <td>{{ g.redName || '—' }}</td>
-            <td>{{ g.blackName || '—' }}</td>
-            <td>
+            <td class="num" data-label="编号">#{{ g.id }}</td>
+            <td data-label="红方">{{ g.redName || '—' }}</td>
+            <td data-label="黑方">{{ g.blackName || '—' }}</td>
+            <td data-label="结果">
               <span class="badge" :class="g.outcome === 'red_win' ? 'badge-red' : g.outcome === 'black_win' ? 'badge-black' : 'badge-amber'">
                 {{ outcomeLabel(g.outcome) }}
               </span>
@@ -198,9 +198,9 @@ function closeReplay() {
                 {{ myResult(g, state.user.id) }}
               </span>
             </td>
-            <td class="num">{{ g.moveCount }}</td>
-            <td class="muted">{{ fmtDateTime(g.finishedAt || g.createdAt) }}</td>
-            <td>
+            <td class="num" data-label="着数">{{ g.moveCount }}</td>
+            <td class="muted" data-label="结束时间">{{ fmtDateTime(g.finishedAt || g.createdAt) }}</td>
+            <td data-label="操作">
               <button class="btn btn-sm" @click.stop="openGame(g.id)">复盘</button>
             </td>
           </tr>
@@ -357,5 +357,75 @@ tbody tr.selected {
   flex-wrap: wrap;
   margin-top: 8px;
   font-size: 0.82rem;
+}
+
+/* ===== 手机端适配 =====
+   对局记录表用 styles.css 里的 .table-cards 变成卡片（窄屏）。
+   这里另外处理标题栏与复盘操作条：标题独占一行、控件占满宽度、按钮 ≥40px。 */
+@media (max-width: 640px) {
+  .history {
+    gap: 12px;
+  }
+
+  .card-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .card-head .btn-row {
+    width: 100%;
+    gap: 8px;
+  }
+
+  /* 「全部对局 / 我的对局」分段按钮与刷新按钮等分整行 */
+  .seg {
+    flex: 1 1 auto;
+  }
+
+  .seg-btn {
+    flex: 1;
+    padding: 10px 8px;
+    min-height: 40px;
+  }
+
+  .card-head .btn-row > .btn {
+    flex: none;
+    min-height: 40px;
+    padding: 8px 14px;
+  }
+
+  /* 复盘卡片标题栏 */
+  .card-head > .badge {
+    align-self: flex-start;
+  }
+
+  /* 复盘控件：两列网格，着数指示独占一行，滑块加高便于拖动 */
+  .replay-controls {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .replay-controls .btn {
+    width: 100%;
+    min-height: 40px;
+  }
+
+  .ply-indicator {
+    grid-column: 1 / -1;
+    text-align: center;
+    order: 2;
+  }
+
+  .ply-slider {
+    height: 28px;
+    margin-top: 10px;
+  }
+
+  .replay-meta {
+    gap: 6px 14px;
+    font-size: 0.78rem;
+  }
 }
 </style>

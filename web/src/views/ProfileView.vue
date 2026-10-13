@@ -112,7 +112,7 @@ function resultOf(game) {
       <template v-if="profile">
         <div class="who">
           <div class="avatar">{{ displayName.slice(0, 1) }}</div>
-          <div>
+          <div class="who-main">
             <h2 class="name">{{ displayName }}</h2>
             <p class="muted meta">
               @{{ profile.username }}
@@ -142,7 +142,7 @@ function resultOf(game) {
         <span class="muted">最近 {{ games.length }} 局</span>
       </div>
 
-      <table v-if="games.length" class="table">
+      <table v-if="games.length" class="table table-cards">
         <thead>
           <tr>
             <th>编号</th>
@@ -156,18 +156,18 @@ function resultOf(game) {
         </thead>
         <tbody>
           <tr v-for="g in games" :key="g.id">
-            <td class="num">#{{ g.id }}</td>
-            <td>{{ g.redName || '—' }}</td>
-            <td>{{ g.blackName || '—' }}</td>
-            <td>
+            <td class="num" data-label="编号">#{{ g.id }}</td>
+            <td data-label="红方">{{ g.redName || '—' }}</td>
+            <td data-label="黑方">{{ g.blackName || '—' }}</td>
+            <td data-label="结果">
               <span v-if="resultOf(g)" class="badge" :class="resultOf(g) === '胜' ? 'badge-green' : resultOf(g) === '负' ? 'badge-red' : 'badge-amber'">
                 {{ resultOf(g) }}
               </span>
               <span class="muted"> {{ outcomeLabel(g.outcome) }}</span>
               <span class="muted"> {{ reasonLabel(g.reason) }}</span>
             </td>
-            <td class="num">{{ g.moveCount }}</td>
-            <td class="muted">{{ fmtDateTime(g.finishedAt || g.createdAt) }}</td>
+            <td class="num" data-label="着数">{{ g.moveCount }}</td>
+            <td class="muted" data-label="时间">{{ fmtDateTime(g.finishedAt || g.createdAt) }}</td>
             <td>
               <router-link v-if="g.status === 'finished'" class="btn btn-sm" :to="`/history/${g.id}`">复盘</router-link>
               <span v-else class="muted">进行中</span>
@@ -265,5 +265,86 @@ function resultOf(game) {
 
 .form-error {
   color: #b3261e;
+}
+
+/* ===== 手机端适配（战绩卡片与统计数字换行，不横向溢出）=====
+   桌面端 96px 起的三列/多列网格在 360px 上仍能放下三列，
+   这里显式固定列数并收紧字号，避免长昵称/等级分把行撑破。 */
+@media (max-width: 640px) {
+  .card-head {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .who {
+    gap: 10px;
+  }
+
+  .avatar {
+    width: 44px;
+    height: 44px;
+    font-size: 1.2rem;
+  }
+
+  /* 昵称与注册信息可收缩，超长内容换行而不是撑破卡片 */
+  .who-main {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .name {
+    font-size: 1.12rem;
+    overflow-wrap: anywhere;
+  }
+
+  .meta {
+    font-size: 0.78rem;
+    overflow-wrap: anywhere;
+  }
+
+  /* 等级分从右侧浮动改为独占一行，避免与长昵称抢宽度 */
+  .rating-box {
+    flex: 1 1 100%;
+    margin-left: 0;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 6px;
+    text-align: left;
+    border-top: 1px dashed var(--border-soft);
+    padding-top: 8px;
+  }
+
+  .rating-value {
+    font-size: 1.4rem;
+  }
+
+  .stat-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .stat {
+    padding: 8px 6px;
+  }
+
+  .stat-num {
+    font-size: 1.1rem;
+  }
+
+  .stat-num.small {
+    font-size: 0.84rem;
+  }
+
+  .stat-label {
+    font-size: 0.74rem;
+  }
+}
+
+/* 极窄屏：统计卡片降到两列 */
+@media (max-width: 360px) {
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 </style>

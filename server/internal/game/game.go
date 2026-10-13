@@ -38,6 +38,13 @@ const (
 	ReasonAbandoned   Reason = "abandoned"
 )
 
+// 三种由局面重复触发的终局原因：单方长将、单方长捉，以及不变作和。
+const (
+	ReasonPerpetualCheck Reason = "perpetual_check"
+	ReasonPerpetualChase Reason = "perpetual_chase"
+	ReasonRepetition     Reason = "repetition"
+)
+
 // MoveRecord is one played ply as stored in history and sent to clients.
 type MoveRecord struct {
 	Ply      int    `json:"ply"`
@@ -71,11 +78,19 @@ type Game struct {
 	// OutcomeOngoing, so comparing against the constant alone would report
 	// every fresh game as finished.
 	decided bool
+
+	// marks 按步序记录每一步落地后的局面、走子方与是否将军，seen 统计每个局面
+	// 出现过几次。两者一起支撑「三次重复 → 长将/长捉/和棋」的裁决，
+	// 见 repetition.go。
+	marks []plyMark
+	seen  map[positionKey]int
 }
 
 // NewGame returns a fresh game in the opening position.
 func NewGame() *Game {
-	return &Game{board: NewBoard()}
+	g := &Game{board: NewBoard()}
+	g.initTracking()
+	return g
 }
 
 // NewGameFromFEN restores a game from a stored FEN string.
@@ -84,7 +99,9 @@ func NewGameFromFEN(fen string) (*Game, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Game{board: b}, nil
+	g := &Game{board: b}
+	g.initTracking()
+	return g, nil
 }
 
 // Board exposes the current position.
@@ -134,6 +151,13 @@ func (g *Game) Clone() *Game {
 	}
 	c.history = append([]Record(nil), g.history...)
 	c.records = append([]MoveRecord(nil), g.records...)
+	c.marks = append([]plyMark(nil), g.marks...)
+	if g.seen != nil {
+		c.seen = make(map[positionKey]int, len(g.seen))
+		for k, v := range g.seen {
+			c.seen[k] = v
+		}
+	}
 	return c
 }
 
@@ -146,6 +170,7 @@ func (g *Game) ApplyUnchecked(m Move) {
 		halfmove: g.board.Halfmove, fullmove: g.board.Fullmove, turn: g.board.Turn,
 	})
 	g.board.apply(m)
+	g.recordPly(m)
 	g.decided = false
 	g.reason = ""
 }
@@ -248,6 +273,7 @@ func (g *Game) Play(m Move) (MoveRecord, error) {
 		turn: side, notation: notation,
 	})
 	g.board.apply(m)
+	g.recordPly(m)
 
 	entry := MoveRecord{
 		Ply:      len(g.history),
@@ -260,6 +286,13 @@ func (g *Game) Play(m Move) (MoveRecord, error) {
 	g.records = append(g.records, entry)
 
 	g.updateOutcome(captured)
+	if !g.decided {
+		if v := g.Repetition(); v.Decided {
+			g.outcome = v.Outcome
+			g.reason = v.Reason
+			g.decided = true
+		}
+	}
 	return entry, nil
 }
 
@@ -380,6 +413,7 @@ func (g *Game) Undo() (MoveRecord, bool) {
 	g.history = g.history[:len(g.history)-1]
 	entry := g.records[len(g.records)-1]
 	g.records = g.records[:len(g.records)-1]
+	g.dropPosition()
 
 	g.board.Turn = rec.turn
 	g.board.Halfmove = rec.halfmove
