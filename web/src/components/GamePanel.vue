@@ -97,6 +97,14 @@ function displayName(player) {
 function showAiTag(player) {
   return !!player && player.isAI && !String(player.name || '').startsWith('电脑')
 }
+
+/**
+ * A seat only advertises readiness while a game is not running: before the first
+ * move, and between games, when 准备 is what starts the next one.
+ */
+function showReady(player) {
+  return props.status !== 'playing' && !!player && !!player.ready
+}
 </script>
 
 <template>
@@ -109,6 +117,7 @@ function showAiTag(player) {
             {{ displayName(black) }}
             <em v-if="showAiTag(black)" class="tag ai">电脑{{ black.aiLevel ? `（${black.aiLevel}）` : '' }}</em>
             <em v-if="youAre === 'black'" class="tag you">你</em>
+            <em v-if="showReady(black)" class="tag ready">已准备</em>
           </div>
           <div class="seat-sub">
             <span v-if="black && black.rating">等级分 {{ black.rating }}</span>
@@ -151,6 +160,7 @@ function showAiTag(player) {
             {{ displayName(red) }}
             <em v-if="showAiTag(red)" class="tag ai">电脑{{ red.aiLevel ? `（${red.aiLevel}）` : '' }}</em>
             <em v-if="youAre === 'red'" class="tag you">你</em>
+            <em v-if="showReady(red)" class="tag ready">已准备</em>
           </div>
           <div class="seat-sub">
             <span v-if="red && red.rating">等级分 {{ red.rating }}</span>
@@ -297,6 +307,11 @@ function showAiTag(player) {
 .tag.you {
   background: #fbe6ac;
   color: #7a5a10;
+}
+
+.tag.ready {
+  background: #eaf6ec;
+  color: #276b36;
 }
 
 .clock {

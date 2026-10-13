@@ -18,11 +18,12 @@ const REASON_LABEL = {
   timeout: '超时',
   draw_agreed: '协议和棋',
   sixty_move: '六十回合无吃子',
-  abandoned: '掉线判负'
+  abandoned: '对手离开'
 }
 
 const STATUS_LABEL = {
   waiting: '等待对手',
+  ready: '待准备',
   playing: '对局中',
   finished: '已结束'
 }

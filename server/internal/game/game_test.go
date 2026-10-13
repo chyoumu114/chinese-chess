@@ -761,17 +761,62 @@ func TestIsAttackedBasics(t *testing.T) {
 	if rb.IsAttacked(sq(t, "e5"), Red) {
 		t.Errorf("rook attack should be blocked by the pawn on e6")
 	}
-	// With the pawn on e6 as its only screen the cannon attacks the square
-	// immediately beyond it, e5, even though that square is empty: a king
-	// standing there would be in check.
+	// With the pawn on e6 as its only screen the cannon attacks every square
+	// beyond that screen along the file, not only the one next to it: a cannon
+	// jumps over exactly one piece and may stand any distance away.
 	cb2 := boardOf(t, "w", "C", "e9", "p", "e6", "K", "d9", "k", "i0").Board()
-	if !cb2.IsAttacked(sq(t, "e5"), Red) {
-		t.Errorf("cannon on e9 should attack e5 through the screen on e6")
+	for _, hit := range []string{"e5", "e4"} {
+		if !cb2.IsAttacked(sq(t, hit), Red) {
+			t.Errorf("cannon on e9 should attack %s through the screen on e6", hit)
+		}
 	}
-	// e4 lies beyond an empty square, so the cannon has no piece to jump and
-	// attacks nothing there.
-	if cb2.IsAttacked(sq(t, "e4"), Red) {
-		t.Errorf("cannon must not attack past an empty square")
+	// The screen itself and everything on the near side of it is not attacked:
+	// no piece lies between the cannon and those squares.
+	for _, miss := range []string{"e6", "e7", "e8"} {
+		if cb2.IsAttacked(sq(t, miss), Red) {
+			t.Errorf("cannon on e9 must not attack %s, which has no screen in front of it", miss)
+		}
+	}
+}
+
+// TestCannonCheckIsDetectedThroughADistantScreen is the regression test for a
+// cannon check that the detector used to miss whenever the screen was not
+// adjacent to the king. A missed check is what let the attacked side answer with
+// a move that ignored it (送将), because the engine saw no check to resolve.
+func TestCannonCheckIsDetectedThroughADistantScreen(t *testing.T) {
+	// Black cannon e4, Red pawn e7 as the only screen, Red king e9.
+	g := boardOf(t, "w", "c", "e4", "P", "e7", "K", "e9", "k", "d0")
+	if !g.InCheck() {
+		t.Fatalf("the Red king on e9 is in check from the cannon on e4 through the screen on e7")
+	}
+	legal := map[string]bool{}
+	for _, m := range g.LegalMoves() {
+		legal[m.String()] = true
+	}
+	if !legal["e9f9"] {
+		t.Errorf("the king must be able to step off the attacked file, got %v", legal)
+	}
+	for mv := range legal {
+		if mv != "e9f9" {
+			t.Errorf("%s does not answer the check and must not be legal", mv)
+		}
+	}
+	if _, err := g.Play(Move{From: sq(t, "e7"), To: sq(t, "e6")}); err == nil {
+		t.Errorf("moving the screen sideways does not answer the check and must be rejected")
+	}
+}
+
+// TestCannonWithNothingInBetweenDoesNotAttack guards the opposite error: a
+// cannon whose line to the target holds no screen attacks nothing, so the target
+// must not be reported as attacked. A false check refuses legal moves and can
+// even announce a mate that does not exist.
+func TestCannonWithNothingInBetweenDoesNotAttack(t *testing.T) {
+	g := boardOf(t, "w", "c", "e7", "r", "e5", "K", "e9", "k", "d0")
+	if g.InCheck() {
+		t.Errorf("the Red king is not in check although a cannon and a rook share its file")
+	}
+	if g.Board().IsAttacked(sq(t, "e9"), Black) {
+		t.Errorf("the Black cannon on e7 has no screen and cannot attack e9")
 	}
 }
 

@@ -4,8 +4,9 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '../api.js'
+import { protocol } from '../ws.js'
 import { state, joinRoom, toast, connectRealtime } from '../store.js'
-import { AI_LEVELS, fmtDateTime, presenceLabel, sideLabel } from '../format.js'
+import { AI_LEVELS, fmtDateTime, presenceLabel, sideLabel, statusLabel } from '../format.js'
 
 const router = useRouter()
 
@@ -17,6 +18,15 @@ const health = ref(null)
 const signedIn = computed(() => !!state.user)
 const openRooms = computed(() => state.lobby.openRooms || [])
 const online = computed(() => state.presence.online || [])
+/** The room this visitor is currently seated in, if any. */
+const currentRoom = computed(() => state.room)
+const inWaitingRoom = computed(() => !!currentRoom.value && currentRoom.value.status !== 'finished')
+/**
+ * A game in progress pins the player to its room: taking another seat would
+ * forfeit it, so the lobby refuses to start one until they leave on purpose.
+ */
+const inGame = computed(() => !!currentRoom.value && currentRoom.value.status === 'playing')
+const busyHint = computed(() => (inGame.value ? '对局进行中，请先在房间里离开' : ''))
 
 // A join request only navigates once the authoritative room snapshot arrives.
 watch(
@@ -70,20 +80,53 @@ function requireLogin() {
 
 function quickMatch() {
   if (!requireLogin()) return
+  // Already seated somewhere? Return to that room instead of asking for a second
+  // seat, which would only bounce the player back to the same one.
+  if (inWaitingRoom.value) {
+    router.push(`/game/${currentRoom.value.id}`)
+    return
+  }
   joining.value = true
   if (!joinRoom({})) joining.value = false
 }
 
 function joinOpenRoom(room) {
   if (!requireLogin()) return
+  if (inGame.value) {
+    toast(busyHint.value, 'warn')
+    return
+  }
   joining.value = true
   if (!joinRoom({ roomId: room.id, rated: room.rated })) joining.value = false
 }
 
 function startAI() {
   if (!requireLogin()) return
+  if (inGame.value) {
+    toast(busyHint.value, 'warn')
+    return
+  }
   joining.value = true
   if (!joinRoom({ aiLevel: aiLevel.value, side: aiSide.value, rated: false })) joining.value = false
+}
+
+/**
+ * cancelMatch gives up the seat from the lobby: it dissolves a room that is
+ * still waiting and forfeits one that is under way. The server acknowledges it
+ * with a `left` frame, which clears the shared snapshot.
+ */
+function cancelMatch() {
+  const playing = currentRoom.value && currentRoom.value.status === 'playing'
+  if (playing && !window.confirm('对局尚未结束，离开将判负。确定离开房间吗？')) return
+  if (!protocol.leave()) {
+    toast('连接已断开，请稍后重试', 'error')
+    return
+  }
+  joining.value = false
+}
+
+function openRoom() {
+  if (currentRoom.value) router.push(`/game/${currentRoom.value.id}`)
 }
 </script>
 
@@ -99,9 +142,31 @@ function startAI() {
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" :disabled="joining" @click="quickMatch">
-          {{ joining ? '匹配中…' : '快速匹配' }}
+          {{ inWaitingRoom ? '返回我的房间' : joining ? '匹配中…' : '快速匹配' }}
         </button>
         <button class="btn" @click="refreshLobby">刷新</button>
+      </div>
+    </div>
+
+    <div v-if="currentRoom" class="card in-room-card">
+      <div>
+        <strong>你正在第 {{ currentRoom.id }} 号房间</strong>
+        <span class="badge" :class="currentRoom.status === 'playing' ? 'badge-red' : 'badge-amber'">
+          {{ statusLabel(currentRoom.status) }}
+        </span>
+        <p class="muted">
+          <template v-if="currentRoom.status === 'waiting'">正在等待对手加入，可以随时取消匹配。</template>
+          <template v-else-if="currentRoom.status === 'ready'">双方入座，去对局室点「准备」即可开始。</template>
+          <template v-else-if="currentRoom.status === 'playing'">对局进行中。</template>
+          <template v-else>对局已结束，可回对局室点「准备」换边再来一局。</template>
+        </p>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" @click="openRoom">返回对局</button>
+        <button v-if="currentRoom.status !== 'finished'" class="btn btn-sm btn-danger" @click="cancelMatch">
+          {{ currentRoom.status === 'waiting' ? '取消匹配' : '离开房间' }}
+        </button>
+        <button v-else class="btn btn-sm" @click="cancelMatch">离开房间</button>
       </div>
     </div>
 
@@ -133,7 +198,12 @@ function startAI() {
               <td>{{ room.rated ? '计分' : '不计分' }}</td>
               <td class="muted">{{ fmtDateTime(room.createdAt) }}</td>
               <td>
-                <button class="btn btn-sm" :disabled="joining" @click="joinOpenRoom(room)">加入</button>
+                <button
+                  class="btn btn-sm"
+                  :disabled="joining || inGame"
+                  :title="busyHint || '加入这个房间'"
+                  @click="joinOpenRoom(room)"
+                >加入</button>
               </td>
             </tr>
           </tbody>
@@ -212,10 +282,16 @@ function startAI() {
           </div>
         </div>
 
-        <button class="btn btn-primary" :disabled="joining" @click="startAI">开始人机对战</button>
+        <button
+          class="btn btn-primary"
+          :disabled="joining || inGame"
+          :title="busyHint || '开始一局人机对战'"
+          @click="startAI"
+        >开始人机对战</button>
       </div>
 
       <p v-if="!signedIn" class="muted ai-hint">登录后即可开始人机对战。</p>
+      <p v-else-if="inGame" class="muted ai-hint">{{ busyHint }}。</p>
     </section>
   </div>
 </template>
@@ -241,6 +317,24 @@ function startAI() {
 
 .lobby-head p {
   margin: 0;
+}
+
+.in-room-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  background: #fffdf5;
+  border-color: #e8cf94;
+}
+
+.in-room-card p {
+  margin: 4px 0 0;
+}
+
+.in-room-card .badge {
+  margin-left: 8px;
 }
 
 .ai-form {

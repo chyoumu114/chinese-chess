@@ -181,13 +181,65 @@ Get-NetFirewallProfile -Name Public | Get-NetFirewallRule |
    - **Run kind**: `Package`
    - **Package path**: `xiangqi/cmd/server`（模块名取自 `server/go.mod`）
    - **Working directory**: `\\wsl.localhost\Ubuntu-24.04\home\<你>\projects\chinese-chess\server`
-   - **Environment**：按需填 `XIANGQI_DB_HOST=127.0.0.1` 等，或直接用默认值
+   - **Environment**：**必须填数据库凭据**（见 2.6.1），否则后端启动即失败
 3. 点 Debug（虫子图标），在 `internal/game/moves.go` 之类的地方下断点验证能停下
 
 > 数据库先用 compose 起起来（只起 MySQL 即可）：
 > `cd ~/projects/chinese-chess/deploy && docker compose up -d mysql`
 >
-> 后端在 WSL 里跑、MySQL 在 WSL 的容器里跑，`127.0.0.1:3306` 直通，无需额外配置。
+> 后端在 WSL 里跑、MySQL 在 WSL 的容器里跑，`127.0.0.1:3306` 直通。
+>
+> **但"直通"只解决网络，不解决凭据**：不填 Environment 就会报 1045，见 2.6.1。
+
+#### 2.6.1 为什么端口通了还是连不上：1045
+
+不填 Environment 一定会失败，报的是这条：
+
+```
+fatal: store: ping server 127.0.0.1:3306: Error 1045 (28000):
+Access denied for user 'root'@'172.18.0.1' (using password: YES)
+```
+
+**这与端口、防火墙、WSL 端口转发都无关，不要去动 `MYSQL_BIND`。**
+能收到 MySQL 的 1045，恰恰说明 TCP 这条链已经通了；真不通时是
+`connection refused` 或 `i/o timeout`。原因只是凭据对不上：
+
+| 来源 | 用户名 / 密码 |
+|---|---|
+| `config.Load()` 的默认值 | `root` / `root` |
+| compose 起的 MySQL | `root` / `deploy/.env` 里 `openssl rand -hex 32` 的随机值 |
+
+顺便解释 `'root'@'172.18.0.1'`：从 WSL 访问 `127.0.0.1:3306` 要经 docker-proxy
+转发进容器，容器里看到的源地址就是 Docker 网桥网关 `172.18.0.1`，与你的真实
+IP 无关。也正因为源地址是网关而不是 localhost，**只有 `@'%'` 的账号能连上**。
+
+#### 2.6.2 正确填法
+
+```bash
+# WSL 终端里，打印可直接粘贴的值
+bash scripts/dev-db-env.sh          # GoLand 的 Environment 格式
+bash scripts/dev-db-env.sh json     # VS Code 的 launch.json 用
+```
+
+粘进 **Environment** 框（GoLand 用分号分隔）：
+
+```
+XIANGQI_DB_HOST=127.0.0.1;XIANGQI_DB_PORT=3306;XIANGQI_DB_USER=xiangqi;XIANGQI_DB_PASSWORD=<deploy/.env 里的 MYSQL_PASSWORD>;XIANGQI_DB_NAME=xiangqi
+```
+
+脚本默认给业务账号 `xiangqi`（即 `.env` 里的 `MYSQL_USER`），而不是 root：
+
+- 它是 `'xiangqi'@'%'`，不挑源地址（`root@'%'` 虽然也在，但用它调试没有好处）
+- 它对 `xiangqi.*` 有 `ALL PRIVILEGES`，`Migrate` 建表够用
+- 与容器里 server 的配置一致，少一类"只有我这儿能跑"的问题
+
+> **账号不再每次重启就丢**：这正是接上 MySQL 的意义。账号与棋局都落在
+> `mysql-data` 卷里，`docker compose down`（不加 `-v`）后重启依然在。
+> 只有 `-store memory` 才是一切随进程清零。
+
+> 万一库还没建（例如手工起的裸实例）：普通账号没有 `CREATE DATABASE` 权限，
+> 此时在 **Program arguments** 里加 `-no-create-db`；compose 里
+> `MYSQL_DATABASE` 已经把库建好，所以平时不需要加。
 
 ### 2.7 前端实时调试
 
@@ -253,11 +305,17 @@ Windows 浏览器直接打开 <http://127.0.0.1:5173> 即可，改代码即时�
       "request": "launch",
       "mode": "auto",
       "program": "${workspaceFolder}/server/cmd/server",
-      "env": { "XIANGQI_DB_HOST": "127.0.0.1" }
+      "env": {
+        "XIANGQI_DB_HOST": "127.0.0.1",
+        "XIANGQI_DB_USER": "xiangqi",
+        "XIANGQI_DB_PASSWORD": "<deploy/.env 里的 MYSQL_PASSWORD>"
+      }
     }
   ]
 }
 ```
+
+`env` 里的凭据同样可以用 `bash scripts/dev-db-env.sh json` 生成（缺了它一样是 2.6.1 那个 1045）。
 
 VS Code 的调试器同样跑在 WSL 侧，**不需要额外的防火墙配置**——
 这是它比 GoLand 省事的一点。

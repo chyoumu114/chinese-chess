@@ -135,6 +135,15 @@ func TestSessionUpdateDoesNotDeadlock(t *testing.T) {
 	hub.attachRoom(bob, roomID)
 	bob.enqueueRoomSnapshot(roomID)
 
+	// Both players have to accept the game before the pieces move; the frames
+	// that do it travel through the same session the hub drives.
+	if _, err := session.Ready(ctx, roomID, 1); err != nil {
+		t.Fatalf("alice ready: %v", err)
+	}
+	if _, err := session.Ready(ctx, roomID, 2); err != nil {
+		t.Fatalf("bob ready: %v", err)
+	}
+
 	// The worker must also deliver subsequent updates to both watchers.
 	if _, err := session.SubmitMove(ctx, roomID, 1, "b7", "e7"); err != nil {
 		t.Fatalf("move: %v", err)
@@ -183,6 +192,13 @@ func TestBroadcastCarriesPerClientSide(t *testing.T) {
 	}
 	hub.attachRoom(bob, roomID)
 
+	// Both players accept, which is what starts a human game.
+	for _, userID := range []int64{1, 2} {
+		if _, err := session.Ready(ctx, roomID, userID); err != nil {
+			t.Fatalf("player %d ready: %v", userID, err)
+		}
+	}
+
 	_, aliceRooms := drain(t, alice, 2*time.Second)
 	_, bobRooms := drain(t, bob, 2*time.Second)
 	if len(aliceRooms) == 0 || len(bobRooms) == 0 {
@@ -194,6 +210,171 @@ func TestBroadcastCarriesPerClientSide(t *testing.T) {
 	if got := bobRooms[len(bobRooms)-1].YouAre; got != "black" {
 		t.Errorf("bob was told he plays %q, want black", got)
 	}
+	if got := bobRooms[len(bobRooms)-1].Status; got != gamehall.StatusPlaying {
+		t.Errorf("the last snapshot reports status %q, want playing", got)
+	}
+}
+
+// waitUntil reads frames until done reports true for everything observed so far.
+// Several frames belong to one logical event (a room snapshot, the game_over
+// announcement and the opponent_left notice all follow a departure), and their
+// order is not fixed: the snapshot travels through the broadcast worker while the
+// announcements are queued directly. Waiting for all of them at once keeps the
+// assertions deterministic without fixing an order that does not exist.
+func waitUntil(t *testing.T, c *Client, wait time.Duration, done func([]string, []gamehall.RoomView) bool) ([]string, []gamehall.RoomView) {
+	t.Helper()
+	deadline := time.After(wait)
+	var types []string
+	var rooms []gamehall.RoomView
+	for {
+		select {
+		case env := <-c.send:
+			types = append(types, env.Type)
+			if env.Type == TypeRoom {
+				var view gamehall.RoomView
+				if err := json.Unmarshal(env.Data, &view); err != nil {
+					t.Fatalf("room payload does not decode: %v", err)
+				}
+				rooms = append(rooms, view)
+			}
+			if done(types, rooms) {
+				return types, rooms
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for frames (saw %v, last room %+v)", types, lastRoom(rooms))
+			return types, rooms
+		}
+	}
+}
+
+// waitRoom reads frames until a room snapshot satisfies pred, returning every
+// frame type seen (the matching one last) and the snapshots collected. Reading
+// until the state matches keeps the assertions about state rather than about
+// timing.
+func waitRoom(t *testing.T, c *Client, pred func(gamehall.RoomView) bool, wait time.Duration) ([]string, []gamehall.RoomView) {
+	t.Helper()
+	return waitUntil(t, c, wait, func(_ []string, rooms []gamehall.RoomView) bool {
+		return len(rooms) > 0 && pred(rooms[len(rooms)-1])
+	})
+}
+
+// waitFrame reads frames until one of the wanted type arrives. It is used for
+// frames that carry no room snapshot.
+func waitFrame(t *testing.T, c *Client, kind string, wait time.Duration) ([]string, []gamehall.RoomView) {
+	t.Helper()
+	return waitUntil(t, c, wait, func(types []string, _ []gamehall.RoomView) bool {
+		return hasFrame(types, kind)
+	})
+}
+
+// lastRoom returns the newest snapshot for a failure message.
+func lastRoom(rooms []gamehall.RoomView) gamehall.RoomView {
+	if len(rooms) == 0 {
+		return gamehall.RoomView{}
+	}
+	return rooms[len(rooms)-1]
+}
+
+// TestLeavingOverTheWire drives the ready and leave frames through the
+// transport: two players take seats, accept the game, and one walks away. The
+// leaver must be detached from the room and acknowledged, while the opponent is
+// told the game ended by abandonment.
+func TestLeavingOverTheWire(t *testing.T) {
+	session := gamehall.NewSession(gamehall.Config{TurnTimeout: time.Minute}, nil)
+	hub := newTestHub(t, session)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.runBroadcasts(ctx)
+
+	alice := fakeClient(hub, 1, "alice")
+	bob := fakeClient(hub, 2, "bob")
+	hub.add(alice)
+	hub.add(bob)
+
+	alice.handle(Envelope{Type: TypeJoin})
+	_, rooms := waitRoom(t, alice, func(v gamehall.RoomView) bool { return v.Status == gamehall.StatusWaiting }, 3*time.Second)
+	roomID := rooms[len(rooms)-1].ID
+
+	bob.handle(Envelope{Type: TypeJoin})
+	if _, rooms := waitRoom(t, bob, func(v gamehall.RoomView) bool { return v.Status == gamehall.StatusReady }, 3*time.Second); len(rooms) == 0 {
+		t.Fatalf("bob received no room snapshot")
+	}
+
+	// Both players accept the game: this is what starts it. The second press must
+	// reach both clients, otherwise they would sit in front of a ready board.
+	alice.handle(Envelope{Type: TypeReady})
+	_, rooms = waitRoom(t, alice, func(v gamehall.RoomView) bool { return v.Red.Ready }, 3*time.Second)
+	if got := rooms[len(rooms)-1].Status; got != gamehall.StatusReady {
+		t.Fatalf("status after one 准备 = %q, want ready", got)
+	}
+	bob.handle(Envelope{Type: TypeReady})
+	_, aliceRooms := waitRoom(t, alice, func(v gamehall.RoomView) bool { return v.Status == gamehall.StatusPlaying }, 3*time.Second)
+	if got := aliceRooms[len(aliceRooms)-1].Status; got != gamehall.StatusPlaying {
+		t.Fatalf("alice's status after both 准备 = %q, want playing", got)
+	}
+	_, bobRooms := waitRoom(t, bob, func(v gamehall.RoomView) bool { return v.Status == gamehall.StatusPlaying }, 3*time.Second)
+	if got := bobRooms[len(bobRooms)-1].Status; got != gamehall.StatusPlaying {
+		t.Fatalf("bob's status after both 准备 = %q, want playing", got)
+	}
+
+	// Flush the duplicate snapshots the coalescing may have queued, so the
+	// no-more-snapshots assertion below is about the departure and not about
+	// leftovers. Nothing produces frames in between, so this is a fifo drain.
+	drain(t, bob, 200*time.Millisecond)
+
+	// Bob leaves in the middle of the game.
+	bob.handle(Envelope{Type: TypeLeave})
+	bobTypes, _ := waitFrame(t, bob, TypeLeft, 3*time.Second)
+	if hasFrame(bobTypes, TypeRoom) {
+		t.Errorf("bob kept receiving snapshots of the room he left: %v", bobTypes)
+	}
+	if _, ok := session.RoomIDForUser(2); ok {
+		t.Errorf("bob is still seated in a room after leaving")
+	}
+	hub.mu.RLock()
+	_, watching := hub.byRoom[roomID][bob]
+	hub.mu.RUnlock()
+	if watching {
+		t.Errorf("bob is still registered as a watcher of room %d", roomID)
+	}
+
+	// Alice is told the game is over and why. The three frames of the departure
+	// may arrive in any order, so all of them are awaited together.
+	aliceTypes, aliceRooms := waitUntil(t, alice, 3*time.Second, func(types []string, rooms []gamehall.RoomView) bool {
+		finished := len(rooms) > 0 && rooms[len(rooms)-1].Status == gamehall.StatusFinished
+		return hasFrame(types, TypeGameOver) && hasFrame(types, TypeOpponentLeft) && finished
+	})
+	if !hasFrame(aliceTypes, TypeGameOver) {
+		t.Errorf("alice was not told the game ended: %v", aliceTypes)
+	}
+	last := aliceRooms[len(aliceRooms)-1]
+	if last.Result == nil || last.Result.Reason != string(game.ReasonAbandoned) {
+		t.Errorf("result = %+v, want an abandonment", last.Result)
+	}
+	if last.Black.UserID != 0 {
+		t.Errorf("bob's seat was not freed: %+v", last.Black)
+	}
+	if last.Red.UserID != 1 {
+		t.Errorf("alice lost her seat: %+v", last.Red)
+	}
+
+	// Alice is alone now: her 准备 reopens the room instead of starting a game.
+	alice.handle(Envelope{Type: TypeReady})
+	_, rooms = waitRoom(t, alice, func(v gamehall.RoomView) bool { return v.Status == gamehall.StatusWaiting }, 3*time.Second)
+	if len(rooms) == 0 {
+		t.Fatalf("alice received no snapshot after reopening the room")
+	}
+}
+
+// hasFrame reports whether a drained frame list holds a given message type.
+func hasFrame(types []string, kind string) bool {
+	for _, t := range types {
+		if t == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // TestAIMoveIsScheduledForTheComputerSeat checks the hub claims the computer's

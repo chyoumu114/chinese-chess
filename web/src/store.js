@@ -205,6 +205,14 @@ export function installRealtime() {
     toast(`${(data && data.name) || '对手'} 已断线离开`, 'error', 8000)
   })
 
+  // The server acknowledged that we gave up our seat. Dropping the snapshot is
+  // what removes the "you are in a game" bar and returns the lobby to normal.
+  ws.on('left', () => {
+    clearRoom()
+    state.chat = []
+    toast('已离开房间', 'info')
+  })
+
   ws.on('presence', (data) => {
     state.presence = {
       online: (data && data.online) || [],

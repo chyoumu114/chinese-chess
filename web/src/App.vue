@@ -6,6 +6,7 @@ import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { state, signOut, toast } from './store.js'
 import ToastHost from './components/ToastHost.vue'
+import GamePrompt from './components/GamePrompt.vue'
 
 const router = useRouter()
 
@@ -82,6 +83,8 @@ function backToGame() {
     </footer>
 
     <ToastHost />
+    <!-- Draw and takeback requests are answered in a modal, wherever they arrive. -->
+    <GamePrompt />
   </div>
 </template>
 

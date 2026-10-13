@@ -125,8 +125,10 @@ Game 对象：
 
 | type | data | 说明 |
 |---|---|---|
-| `join` | `{ "roomId"?: number, "aiLevel"?: 1\|2\|3, "side"?: "red"\|"black", "rated"?: boolean }` | 入座。无 `roomId` 时自动匹配：有等待中的房间就加入，否则新建。带 `aiLevel` 时为单人对电脑。重复 `join` 会回到原有座位。 |
-| `move` | `{ "from": "b7", "to": "e7" }` | 走棋。 |
+| `join` | `{ "roomId"?: number, "aiLevel"?: 1\|2\|3, "side"?: "red"\|"black", "rated"?: boolean }` | 入座。无 `roomId` 时自动匹配：有等待中的房间就加入，否则新建。带 `aiLevel` 时为单人对电脑。重复 `join` 会回到原有座位（已结束的房间除外：无 `roomId` 的 `join` 会离开旧房间并重新匹配）。 |
+| `ready` | 无 | 准备。双方都 `ready` 后对局才开始；对局结束后双方再次 `ready` 即在**同一房间**换边开始下一局。人机对局中电脑永远算已准备。 |
+| `leave` | 无 | 离开房间。等待中离开会解散房间（取消匹配）；对局进行中离开判负（`reason: "abandoned"`）；离开最后一个人会删除房间。 |
+| `move` | `{ "from": "b7", "to": "e7" }` | 走棋。被将军时必须应将，其它着法一律被拒。 |
 | `resign` | 无 | 认输。 |
 | `offer_draw` | 无 | 提议和棋。 |
 | `respond_draw` | `{ "accept": true\|false }` | 回应和棋提议。 |
@@ -151,16 +153,37 @@ Game 对象：
 | `takeback_requested` | `{ "roomId": 1, "by": "red", "name": "alice" }` |
 | `takeback_applied` | `{ "roomId": 1 }` |
 | `takeback_declined` | `{ "roomId": 1, "by": "bob" }` |
-| `opponent_left` | `{ "roomId": 1, "name": "bob" }` |
+| `opponent_left` | `{ "roomId": 1, "name": "bob" }`，对方主动离开时额外带 `"left": true` |
+| `left` | `{ "roomId": 1, "dissolved": true }`（回应 `leave`；`dissolved` 表示房间已被解散） |
 | `presence` | `{ "online": [ { "userId": 1, "name": "alice", "roomId": 1, "status": "online"\|"playing"\|"waiting" } ], "rooms": 2 }` |
 | `pong` | 无 |
+
+### 房间生命周期
+
+一个房间会连续承载多局，状态机只有一条回路：
+
+```
+waiting ──第二位玩家入座──▶ ready ──双方都 ready──▶ playing ──终局──▶ finished
+   ▲                          │                                     │
+   └────────一方离开───────────┘                                     │
+   ▲                                                                │
+   └────────双方再次 ready（同一房间，红黑互换）───────────────────────┘
+```
+
+- `waiting`：只有一个座位有人（或双方都已离开后重开）。此时可 `leave` 解散房间。
+- `ready`：两个座位都有人，但**必须双方都发 `ready` 才会开始**。`red.ready` / `black.ready`
+  让客户端显示“已准备”。
+- `playing`：`legalFrom` 才会下发；被将军的一方只能走解将的着法。
+- `finished`：`result` 出现。双方**不会**自动离开房间，可以再次 `ready` 在同一房间换边再战
+  （`resetLocked` 会让红黑座位互换、棋盘重置，并为新对局另建一条 `games` 记录）。
+  对手已经离开时，`ready` 会把房间重新放回大厅等待新对手。
 
 ### `room` 快照（关键结构）
 
 ```json
 {
   "id": 1,
-  "status": "waiting | playing | finished",
+  "status": "waiting | ready | playing | finished",
   "fen": "当前局面 FEN",
   "turn": "red | black",
   "inCheck": false,
@@ -168,8 +191,8 @@ Game 对象：
   "reason": "checkmate",
   "winnerSide": "red",
   "rated": true,
-  "red":   { "userId": 1, "name": "alice", "side": "red",   "online": true,  "isAI": false, "msLeft": 300000, "moveCount": 20 },
-  "black": { "userId": 0, "name": "电脑（2）", "side": "black", "online": true, "isAI": true, "aiLevel": 2, "msLeft": 280000, "moveCount": 20 },
+  "red":   { "userId": 1, "name": "alice", "side": "red",   "online": true,  "isAI": false, "ready": true, "msLeft": 300000, "moveCount": 20 },
+  "black": { "userId": 0, "name": "电脑（2）", "side": "black", "online": true, "isAI": true, "aiLevel": 2, "ready": true, "msLeft": 280000, "moveCount": 20 },
   "moves": [ { "ply": 1, "side": "red", "from": "b7", "to": "e7", "notation": "炮八平五", "check": false, "msSpent": 1200 } ],
   "legalFrom": { "a9": ["a8", "a7"], "b7": ["a7", "c7", "..."] },
   "youAre": "red",
@@ -181,23 +204,27 @@ Game 对象：
 
 **要点：**
 - `legalFrom` 只在 `status === "playing"` 时提供。键是起点格子名，值是合法终点数组。
-  棋盘高亮**必须**以此为准，不要在前端实现规则。
+  棋盘高亮**必须**以此为准，不要在前端实现规则。被将军时这里只会出现解将的着法
+  （吃掉将军的子、垫将、走将），前端据此提示“必须应将”即可。
+- `ready`（每个座位一个）表示该方是否已点「准备」。电脑座位永远为 `true`。
+  只有 `status === "ready"` 或 `"finished"` 时才有意义。
 - `youAre` 是后端按连接填入的，告诉这个客户端执哪一方。它同时决定棋盘的显示朝向
-  （见 §一「棋盘朝向」）。
+  （见 §一「棋盘朝向」）。换边重开后同一个连接的 `youAre` 会反转。
 - `msLeft` 为 `0` 表示该座位**不限时**（当前默认：步时与局时都无限），界面应显示成
   「不限」而不是 `00:00`。只有运营方配置了限时才可能拿到非 0 值。
 - `moves` 是完整着法列表（含中文记谱），刷新/重连后可直接重建棋谱面板。
 - `fen` 每次都是完整局面，前端可只依赖它渲染棋盘，不需要自己推演。
 - `result` 只在 `status === "finished"` 时出现，与 `game_over` 消息内容一致。
   **前端渲染胜负横幅应以 `room.result` 为准**，这样重连或漏帧也能正确显示。
+  对手中途离开时 `reason` 为 `abandoned`。
 - 注意 `room.id` 是**对局房间号**，`games` 表里的 `game.id` 是另一个编号，
-  两者不相等；不要混用。
+  两者不相等；不要混用。同一个 `room.id` 下的多局对局在 `games` 表里是多条记录。
 
 ### 错误码
 
 `login_required`（未登录）、`room_not_found`、`room_full`、`not_seated`、`not_your_turn`、
-`illegal_move`、`no_piece`、`wrong_side`、`finished`、`not_started`、`nothing_pending`、
-`bad_frame`、`bad_payload`、`bad_move`、`unknown_type`、`internal`。
+`illegal_move`、`no_piece`、`wrong_side`、`finished`、`not_started`、`game_in_progress`、
+`nothing_pending`、`bad_frame`、`bad_payload`、`bad_move`、`unknown_type`、`internal`。
 
 ## 四、前端实现要求
 
@@ -215,11 +242,20 @@ Game 对象：
    `viewRow()` 与其反函数 `squareAt()`），落子前必须把屏幕格子换回 FEN 格子名。
 5. **必须实现的页面**：
    - 登录/注册（同一页切换）
-   - 大厅：在线列表、等待中的房间、快速匹配、人机对战（三档难度、可选执红/执黑）
+   - 大厅：在线列表、等待中的房间、快速匹配、人机对战（三档难度、可选执红/执黑）；
+     已入座时必须能看到自己所在的房间并能取消匹配（发 `leave`）
    - 对局室：棋盘（按 `youAre` 决定朝向）、双方信息与剩余时间（不限时时显示「不限」）、
-     着法列表（中文记谱，红黑分列）、认输/提和/悔棋/聊天按钮
+     着法列表（中文记谱，红黑分列）、认输/提和/悔棋/聊天按钮，以及：
+     - `status === "ready"` 时显示「准备」按钮，并显示双方谁已准备；
+     - `status === "finished"` 时显示「准备（换边再来一局）」，点后发 `ready`，
+       同一房间换边重开，**不要新建房间**；
+     - 「离开房间 / 解散房间」按钮（等待中即取消匹配，对局中会判负，需二次确认）；
+     - 被将军（`inCheck`）时给出显眼提示：只能走 `legalFrom` 里的解将着法。
    - 棋谱与排行榜：历史对局列表、点击进入回放（只读棋盘 + 着法列表）
    - 个人资料：战绩与近期对局
 6. **健壮性**：WebSocket 断线后按 2 秒间隔自动重连，重连成功立即发 `sync`。
    收到的每个 `error` 都要有可见提示（不要静默丢弃）。
+   提和 / 悔棋这类需要对手答复的请求必须足够显眼：收到对方的请求用**模态弹窗**
+   让玩家立刻看到并作答（本仓库是 `components/GamePrompt.vue`，挂在应用外壳上，
+   在任何页面都能弹出）；自己发出的请求要留下常驻提示，不能只靠几秒就消失的 toast。
 7. **语言**：界面文案用简体中文。

@@ -35,7 +35,8 @@ func newTestSession(t *testing.T) (*Session, *fakeClock) {
 }
 
 // TestMatchmakingPairsTwoPlayers checks that a second join takes the open seat
-// of the first player's room.
+// of the first player's room, and that the game starts only once both players
+// have accepted it.
 func TestMatchmakingPairsTwoPlayers(t *testing.T) {
 	s, _ := newTestSession(t)
 	ctx := context.Background()
@@ -63,8 +64,43 @@ func TestMatchmakingPairsTwoPlayers(t *testing.T) {
 		t.Fatalf("second player side = %v, want black", sideB)
 	}
 	view, _ = s.View(roomA)
+	if view.Status != StatusReady {
+		t.Fatalf("room status after both players sat down = %q, want ready", view.Status)
+	}
+	if len(view.LegalFrom) != 0 {
+		t.Errorf("a room that has not started must not publish legal moves")
+	}
+
+	// One player pressing 准备 is not enough.
+	out, err := s.Ready(ctx, roomA, 1)
+	if err != nil {
+		t.Fatalf("red ready: %v", err)
+	}
+	if out.Started {
+		t.Fatalf("the game started with only one player ready")
+	}
+	view, _ = s.View(roomA)
+	if !view.Red.Ready || view.Black.Ready {
+		t.Fatalf("ready flags = red %v / black %v, want red only", view.Red.Ready, view.Black.Ready)
+	}
+	if _, err := s.SubmitMove(ctx, roomA, 1, "h7", "e7"); !errors.Is(err, ErrGameNotStarted) {
+		t.Fatalf("a move before both players were ready: got %v, want ErrGameNotStarted", err)
+	}
+
+	// The second press starts it.
+	out, err = s.Ready(ctx, roomA, 2)
+	if err != nil {
+		t.Fatalf("black ready: %v", err)
+	}
+	if !out.Started || out.Restarted {
+		t.Fatalf("second 准备 = %+v, want a first game starting", out)
+	}
+	view, _ = s.View(roomA)
 	if view.Status != StatusPlaying {
 		t.Fatalf("room status = %q, want playing", view.Status)
+	}
+	if view.Red.Ready || view.Black.Ready {
+		t.Errorf("the ready flags must be cleared once the game starts")
 	}
 	if view.Turn != "red" {
 		t.Fatalf("turn = %q, want red", view.Turn)
@@ -567,6 +603,44 @@ func TestDisconnectMarksSeatOffline(t *testing.T) {
 	}
 }
 
+// TestSnapshotReportsACannonCheckAndRefusesToIgnoreIt is the integration-level
+// regression test for 送将: a cannon check whose screen stands far from the king
+// must reach the client as `inCheck` (so the board warns the player) and must
+// stop every move that does not answer it.
+func TestSnapshotReportsACannonCheckAndRefusesToIgnoreIt(t *testing.T) {
+	s, _ := newTestSession(t)
+	ctx := context.Background()
+	roomID := mustRoom(t, s, ctx, 1, "alice", 2, "bob")
+
+	// Install the position directly: alice (red) is checked by the black cannon
+	// on e4, with the red pawn on e7 as the only screen.
+	g, err := game.NewGameFromFEN("3k5/9/9/9/4c4/9/9/4P4/9/4K4 w - - 0 1")
+	if err != nil {
+		t.Fatalf("build position: %v", err)
+	}
+	s.mu.Lock()
+	if r, ok := s.rooms[roomID]; ok {
+		r.Game = g
+		r.Moves = nil
+	}
+	s.mu.Unlock()
+
+	view, _ := s.View(roomID)
+	if !view.InCheck {
+		t.Fatalf("the snapshot must report the cannon check on the red king")
+	}
+	if _, err := s.SubmitMove(ctx, roomID, 1, "e7", "e6"); !errors.Is(err, game.ErrIllegalMove) {
+		t.Fatalf("a move that ignores the check: got %v, want ErrIllegalMove", err)
+	}
+	if _, err := s.SubmitMove(ctx, roomID, 1, "e9", "f9"); err != nil {
+		t.Fatalf("the king stepping off the attacked file was refused: %v", err)
+	}
+	view, _ = s.View(roomID)
+	if view.InCheck {
+		t.Errorf("the check should be gone once the king stepped aside")
+	}
+}
+
 // TestSnapshotPublishesLegalMoves checks the client can drive highlighting from
 // the snapshot alone.
 func TestSnapshotPublishesLegalMoves(t *testing.T) {
@@ -717,8 +791,328 @@ func TestOpenRoomsListsWaitingGames(t *testing.T) {
 	}
 }
 
+// TestLeaveDissolvesAWaitingRoom covers cancelling a quick match: when the last
+// seat leaves, the room goes with it, so no empty invitation stays in the lobby.
+func TestLeaveDissolvesAWaitingRoom(t *testing.T) {
+	s, _ := newTestSession(t)
+	ctx := context.Background()
+
+	roomID, _, err := s.Join(ctx, JoinRequest{UserID: 1, Name: "alice"})
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	out := s.Leave(ctx, roomID, 1)
+	if !out.Dissolved {
+		t.Fatalf("leaving the only seat must dissolve the room, got %+v", out)
+	}
+	if _, ok := s.View(roomID); ok {
+		t.Fatalf("the dissolved room is still there")
+	}
+	if len(s.OpenRooms()) != 0 {
+		t.Fatalf("a dissolved room is still advertised: %+v", s.OpenRooms())
+	}
+	// Leaving twice, or leaving a room that is gone, must be harmless.
+	if out := s.Leave(ctx, roomID, 1); out.Dissolved {
+		t.Errorf("leaving a vanished room reported a dissolve")
+	}
+	// The player is free to match again straight away.
+	room2, side, err := s.Join(ctx, JoinRequest{UserID: 1, Name: "alice"})
+	if err != nil {
+		t.Fatalf("rejoin after leaving: %v", err)
+	}
+	if room2 == roomID || side != game.Red {
+		t.Fatalf("rejoin gave room %d as %v, want a new room as red", room2, side)
+	}
+}
+
+// TestLeaveDuringAGameIsAnAbandonment checks the opponent is credited with the
+// win, with a reason of its own, and that the seat is handed back.
+func TestLeaveDuringAGameIsAnAbandonment(t *testing.T) {
+	s, _ := newTestSession(t)
+	ctx := context.Background()
+	roomID := mustRoom(t, s, ctx, 1, "alice", 2, "bob")
+	if _, err := s.SubmitMove(ctx, roomID, 1, "h7", "e7"); err != nil {
+		t.Fatalf("move: %v", err)
+	}
+
+	out := s.Leave(ctx, roomID, 1)
+	if out.Result == nil {
+		t.Fatalf("leaving a running game must produce a result")
+	}
+	if out.Result.WinnerSide != "black" || out.Result.Reason != string(game.ReasonAbandoned) {
+		t.Fatalf("result = %+v, want a black win by abandonment", out.Result)
+	}
+	if out.Dissolved {
+		t.Fatalf("the opponent is still in the room, which must not be dissolved")
+	}
+	view, ok := s.View(roomID)
+	if !ok {
+		t.Fatalf("the room vanished although the opponent is still there")
+	}
+	if view.Status != StatusFinished || view.Result == nil {
+		t.Fatalf("status = %q result = %+v, want a finished room carrying the result", view.Status, view.Result)
+	}
+	if view.Red.UserID != 0 || view.Red.Name != "" {
+		t.Errorf("the seat of the player who left was not freed: %+v", view.Red)
+	}
+	if view.Black.UserID != 2 || view.Black.Name != "bob" {
+		t.Errorf("the opponent lost their seat: %+v", view.Black)
+	}
+	// The player who walked away can start over elsewhere.
+	if _, _, err := s.Join(ctx, JoinRequest{UserID: 1, Name: "alice"}); err != nil {
+		t.Fatalf("the player who left could not join again: %v", err)
+	}
+}
+
+// TestLeaveBeforeTheFirstMoveFreesTheOpponent checks that a room whose game never
+// started goes back to the lobby instead of pretending to be ready.
+func TestLeaveBeforeTheFirstMoveFreesTheOpponent(t *testing.T) {
+	s, _ := newTestSession(t)
+	ctx := context.Background()
+	roomID, _, err := s.Join(ctx, JoinRequest{UserID: 1, Name: "alice"})
+	if err != nil {
+		t.Fatalf("alice join: %v", err)
+	}
+	if _, _, err := s.Join(ctx, JoinRequest{UserID: 2, Name: "bob"}); err != nil {
+		t.Fatalf("bob join: %v", err)
+	}
+
+	if out := s.Leave(ctx, roomID, 2); out.Dissolved {
+		t.Fatalf("alice is still seated, so the room must survive")
+	}
+	view, _ := s.View(roomID)
+	if view.Status != StatusWaiting {
+		t.Fatalf("status = %q, want waiting", view.Status)
+	}
+	if view.Black.UserID != 0 || view.Black.Name != "" {
+		t.Errorf("bob's seat was not freed: %+v", view.Black)
+	}
+	if len(s.OpenRooms()) != 1 {
+		t.Fatalf("the room should be advertised for a new opponent: %+v", s.OpenRooms())
+	}
+}
+
+// TestRematchKeepsTheRoomAndSwapsColours covers the end-of-game flow: both
+// players stay in the room, both press 准备, and a fresh game starts in the same
+// room with the colours swapped.
+func TestRematchKeepsTheRoomAndSwapsColours(t *testing.T) {
+	s, _ := newTestSession(t)
+	ctx := context.Background()
+	roomID := mustRoom(t, s, ctx, 1, "alice", 2, "bob")
+	if _, err := s.SubmitMove(ctx, roomID, 1, "h7", "e7"); err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	if _, err := s.Resign(ctx, roomID, 2); err != nil {
+		t.Fatalf("resign: %v", err)
+	}
+	s.SetPersistedID(roomID, 55)
+	if id, ok := s.RoomIDForUser(1); !ok || id != roomID {
+		t.Fatalf("a player lost the finished room: got %d/%v, want %d", id, ok, roomID)
+	}
+
+	// One 准备 is not enough, and the result stays on screen meanwhile.
+	out, err := s.Ready(ctx, roomID, 1)
+	if err != nil {
+		t.Fatalf("red ready: %v", err)
+	}
+	if out.Started {
+		t.Fatalf("one player cannot start a rematch")
+	}
+	view, _ := s.View(roomID)
+	if view.Status != StatusFinished || view.Result == nil {
+		t.Fatalf("status = %q result = %+v, want the finished game until the rematch starts", view.Status, view.Result)
+	}
+	if !view.Red.Ready {
+		t.Errorf("red's readiness was not published")
+	}
+
+	out, err = s.Ready(ctx, roomID, 2)
+	if err != nil {
+		t.Fatalf("black ready: %v", err)
+	}
+	if !out.Started || !out.Restarted {
+		t.Fatalf("outcome = %+v, want a rematch starting", out)
+	}
+
+	view, _ = s.View(roomID)
+	if view.Status != StatusPlaying {
+		t.Fatalf("status = %q, want playing", view.Status)
+	}
+	if view.Result != nil {
+		t.Errorf("the rematch still carries the previous result")
+	}
+	if len(view.Moves) != 0 {
+		t.Errorf("the rematch kept %d plies from the previous game", len(view.Moves))
+	}
+	if view.FEN != game.StartFEN {
+		t.Errorf("the rematch did not reset the board: %s", view.FEN)
+	}
+	if view.Red.UserID != 2 || view.Black.UserID != 1 {
+		t.Fatalf("colours were not swapped: red=%d black=%d", view.Red.UserID, view.Black.UserID)
+	}
+	if view.Red.Name != "bob" || view.Black.Name != "alice" {
+		t.Fatalf("the names did not follow the seats: red=%q black=%q", view.Red.Name, view.Black.Name)
+	}
+	if view.Red.Ready || view.Black.Ready {
+		t.Errorf("the ready flags must be cleared by the rematch")
+	}
+	if len(view.LegalFrom) == 0 {
+		t.Errorf("a restarted room must publish legal moves")
+	}
+	// A rematch is a new game row, not a continuation of the old one: the room
+	// must go back to "no persisted game" so the transport creates a fresh row.
+	if r, ok := s.RoomByID(roomID); !ok || r.PersistedID != 0 {
+		t.Errorf("the rematch kept the previous game row: %+v", r)
+	}
+	// Bob is red now and moves first; Alice, now black, may not.
+	if _, err := s.SubmitMove(ctx, roomID, 1, "a0", "a1"); !errors.Is(err, ErrNotYourTurn) {
+		t.Errorf("the old red player moved first after the swap: %v", err)
+	}
+	if _, err := s.SubmitMove(ctx, roomID, 2, "h7", "e7"); err != nil {
+		t.Errorf("the new red player could not move: %v", err)
+	}
+}
+
+// TestReadyAgainstTheComputerIsARematch checks a solo game follows the same rule:
+// the computer is always ready, so one press starts the next game.
+func TestReadyAgainstTheComputerIsARematch(t *testing.T) {
+	s, _ := newTestSession(t)
+	ctx := context.Background()
+
+	roomID, _, err := s.Join(ctx, JoinRequest{UserID: 1, Name: "alice", AILevel: ai.LevelEasy})
+	if err != nil {
+		t.Fatalf("join against the computer: %v", err)
+	}
+	if _, err := s.Resign(ctx, roomID, 1); err != nil {
+		t.Fatalf("resign: %v", err)
+	}
+
+	out, err := s.Ready(ctx, roomID, 1)
+	if err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+	if !out.Started || !out.Restarted {
+		t.Fatalf("outcome = %+v, want the computer game to restart", out)
+	}
+	view, _ := s.View(roomID)
+	// The seats swap, so the computer takes Red and therefore opens the game.
+	if !view.Red.IsAI || view.Red.UserID != 0 {
+		t.Fatalf("the computer should hold red after the swap: %+v", view.Red)
+	}
+	if view.Black.IsAI || view.Black.UserID != 1 {
+		t.Fatalf("the human should hold black after the swap: %+v", view.Black)
+	}
+	if view.Status != StatusPlaying || len(view.Moves) != 0 {
+		t.Fatalf("status = %q moves = %d, want a fresh game", view.Status, len(view.Moves))
+	}
+	if !view.Red.Ready {
+		t.Errorf("the computer's seat must always report ready")
+	}
+	// The computer is to move first, so the hub can claim its turn immediately.
+	if _, ok := s.TakeAISeat(roomID); !ok {
+		t.Errorf("the computer's turn in the rematch could not be claimed")
+	}
+	// Pressing 准备 while a game is running is refused.
+	if _, err := s.Ready(ctx, roomID, 1); !errors.Is(err, ErrGameInProgress) {
+		t.Errorf("pressing 准备 during a game: got %v, want ErrGameInProgress", err)
+	}
+}
+
+// TestReadyAfterTheOpponentLeftReopensTheRoom checks a player is never stuck in
+// a finished room alone: pressing 准备 advertises it for a new opponent.
+func TestReadyAfterTheOpponentLeftReopensTheRoom(t *testing.T) {
+	s, _ := newTestSession(t)
+	ctx := context.Background()
+	roomID := mustRoom(t, s, ctx, 1, "alice", 2, "bob")
+	if _, err := s.Resign(ctx, roomID, 2); err != nil {
+		t.Fatalf("resign: %v", err)
+	}
+	if out := s.Leave(ctx, roomID, 2); out.Dissolved {
+		t.Fatalf("alice is still seated, so the room must survive")
+	}
+
+	out, err := s.Ready(ctx, roomID, 1)
+	if err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+	if !out.Reopened || out.Started {
+		t.Fatalf("outcome = %+v, want a reopened room", out)
+	}
+	view, _ := s.View(roomID)
+	if view.Status != StatusWaiting {
+		t.Fatalf("status = %q, want waiting", view.Status)
+	}
+	if view.Result != nil {
+		t.Errorf("the previous result should be gone while a new opponent is awaited")
+	}
+	open := s.OpenRooms()
+	if len(open) != 1 || open[0].ID != roomID {
+		t.Fatalf("open rooms = %+v, want the reopened room", open)
+	}
+
+	// A newcomer takes the free seat; both players must accept again, but the
+	// player who had already accepted keeps that acceptance.
+	if _, side, err := s.Join(ctx, JoinRequest{UserID: 3, Name: "carol"}); err != nil {
+		t.Fatalf("carol join: %v", err)
+	} else if side != game.Black {
+		t.Fatalf("carol side = %v, want black", side)
+	}
+	view, _ = s.View(roomID)
+	if view.Status != StatusReady {
+		t.Fatalf("status = %q, want ready", view.Status)
+	}
+	if !view.Red.Ready || view.Black.Ready {
+		t.Fatalf("ready flags = red %v / black %v, want alice still ready", view.Red.Ready, view.Black.Ready)
+	}
+	mustStart(t, s, ctx, roomID, 1, 3)
+	view, _ = s.View(roomID)
+	if view.Red.UserID != 1 || view.Black.UserID != 3 {
+		t.Fatalf("seats after the new pairing: red=%d black=%d", view.Red.UserID, view.Black.UserID)
+	}
+	if len(view.LegalFrom) == 0 {
+		t.Errorf("the reopened room must publish legal moves once it starts")
+	}
+}
+
+// TestQuickMatchDoesNotResumeAFinishedRoom checks the lobby's 快速匹配 button:
+// asking for an opponent while an old game is over must produce a new room.
+func TestQuickMatchDoesNotResumeAFinishedRoom(t *testing.T) {
+	s, _ := newTestSession(t)
+	ctx := context.Background()
+	roomID := mustRoom(t, s, ctx, 1, "alice", 2, "bob")
+	if _, err := s.Resign(ctx, roomID, 2); err != nil {
+		t.Fatalf("resign: %v", err)
+	}
+
+	room2, side, err := s.Join(ctx, JoinRequest{UserID: 1, Name: "alice"})
+	if err != nil {
+		t.Fatalf("quick match after a finished game: %v", err)
+	}
+	if room2 == roomID {
+		t.Fatalf("a quick match resumed the finished room %d", roomID)
+	}
+	if side != game.Red {
+		t.Errorf("side = %v, want red in a fresh room", side)
+	}
+	if id, ok := s.RoomIDForUser(1); !ok || id != room2 {
+		t.Fatalf("the player is still indexed in room %d, want %d", id, room2)
+	}
+	// The old room is still there for its remaining player, who may reopen it.
+	if out, err := s.Ready(ctx, roomID, 2); err != nil {
+		t.Fatalf("bob ready in the room he stayed in: %v", err)
+	} else if out.Started {
+		t.Errorf("bob is alone in the finished room and cannot start a game")
+	} else if !out.Reopened {
+		t.Errorf("bob's 准备 should reopen the room for a new opponent: %+v", out)
+	}
+}
+
 // ---- helpers ----
 
+// mustRoom seats two human players and has both of them press 准备, which is
+// what it takes for the pieces to move. It deliberately goes through Ready
+// rather than poking the status: the rooms the other tests exercise must be
+// reached the way a client reaches them.
 func mustRoom(t *testing.T, s *Session, ctx context.Context, redID int64, redName string, blackID int64, blackName string) int64 {
 	t.Helper()
 	roomID, _, err := s.Join(ctx, JoinRequest{UserID: redID, Name: redName})
@@ -728,7 +1122,23 @@ func mustRoom(t *testing.T, s *Session, ctx context.Context, redID int64, redNam
 	if _, _, err := s.Join(ctx, JoinRequest{UserID: blackID, Name: blackName}); err != nil {
 		t.Fatalf("seat black: %v", err)
 	}
+	mustStart(t, s, ctx, roomID, redID, blackID)
 	return roomID
+}
+
+// mustStart has both players accept the game and fails when it does not start.
+func mustStart(t *testing.T, s *Session, ctx context.Context, roomID int64, redID, blackID int64) {
+	t.Helper()
+	if _, err := s.Ready(ctx, roomID, redID); err != nil {
+		t.Fatalf("red ready: %v", err)
+	}
+	out, err := s.Ready(ctx, roomID, blackID)
+	if err != nil {
+		t.Fatalf("black ready: %v", err)
+	}
+	if !out.Started {
+		t.Fatalf("both players were ready but the game did not start")
+	}
 }
 
 func mustFEN(t *testing.T, s *Session, roomID int64) string {

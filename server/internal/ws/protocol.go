@@ -11,6 +11,13 @@ const (
 	// TypeJoin attaches the connection to a room. An empty RoomID asks the hub
 	// to place the player: into a waiting game, or into a fresh one.
 	TypeJoin = "join"
+	// TypeReady accepts the next game in the caller's room. Two human players
+	// both have to send it before the pieces move; after a finished game it
+	// starts a rematch in the same room with the colours swapped.
+	TypeReady = "ready"
+	// TypeLeave gives up the caller's seat. Leaving the last seat dissolves the
+	// room, which is how a quick match is cancelled.
+	TypeLeave = "leave"
 	// TypeMove submits a move in the current room using UCI-like coordinates.
 	TypeMove = "move"
 	// TypeResign concedes the current game.
@@ -57,6 +64,8 @@ const (
 	TypeTakebackDeclined = "takeback_declined"
 	// TypeOpponentLeft announces that the opponent disconnected.
 	TypeOpponentLeft = "opponent_left"
+	// TypeLeft acknowledges that the caller gave up its seat.
+	TypeLeft = "left"
 	// TypePong answers TypePing.
 	TypePong = "pong"
 	// TypePresence lists who is online in the lobby.
@@ -109,6 +118,14 @@ type ChatRequest struct {
 type ErrorView struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// LeftView confirms that a client no longer occupies a seat, so it can drop the
+// room it was rendering.
+type LeftView struct {
+	RoomID int64 `json:"roomId,omitempty"`
+	// Dissolved is true when the room itself was dropped because it was empty.
+	Dissolved bool `json:"dissolved,omitempty"`
 }
 
 // ChatView is a chat line in the room.

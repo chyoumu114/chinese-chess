@@ -107,28 +107,35 @@ func (h *Hub) onSessionUpdate(roomIDs []int64) {
 
 // runBroadcasts fans room updates out to the clients watching them, until ctx is
 // cancelled.
+//
+// A wake-up first drains the whole burst of queued notifications and only then
+// takes one snapshot per room. The order matters: a notification is queued by the
+// session *after* the change it announces is already applied, so a snapshot taken
+// after the drain covers every change in the burst. Broadcasting eagerly and
+// skipping the rest of the burst would drop the last change of a room — for
+// example the "both players are ready, the game started" update — and leave both
+// clients looking at the previous state until something else happens in the room.
 func (h *Hub) runBroadcasts(ctx context.Context) {
-	// Coalesce the rooms seen in one wake-up so a burst of moves in different
-	// rooms costs one snapshot each, not one per notification.
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case id := <-h.updates:
-			roomID := id
-			h.broadcastRoom(roomID)
-			// Drain anything already queued without blocking.
+			rooms := map[int64]struct{}{id: {}}
+			// Drain anything already queued without blocking, so the snapshots
+			// below are taken once per room instead of once per change.
 			for {
 				select {
 				case next := <-h.updates:
-					if next != roomID {
-						h.broadcastRoom(next)
-					}
+					rooms[next] = struct{}{}
 				default:
-					goto drained
+					goto broadcast
 				}
 			}
-		drained:
+		broadcast:
+			for roomID := range rooms {
+				h.broadcastRoom(roomID)
+			}
 		}
 	}
 }
@@ -186,12 +193,7 @@ func (h *Hub) remove(c *Client) {
 	h.mu.Lock()
 	delete(h.clients, c)
 	for roomID := range c.rooms {
-		if set, ok := h.byRoom[roomID]; ok {
-			delete(set, c)
-			if len(set) == 0 {
-				delete(h.byRoom, roomID)
-			}
-		}
+		h.detachRoomLocked(c, roomID)
 	}
 	h.mu.Unlock()
 }
@@ -207,6 +209,38 @@ func (h *Hub) attachRoom(c *Client, roomID int64) {
 		h.byRoom[roomID] = set
 	}
 	set[c] = struct{}{}
+}
+
+// detachRoom stops delivering a room's updates to a client. It is called before
+// the session is told about a departure, so the snapshot the departure publishes
+// can never reach the client that has just walked away.
+func (h *Hub) detachRoom(c *Client, roomID int64) {
+	if roomID == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.detachRoomLocked(c, roomID)
+}
+
+// detachAll stops delivering updates for every room a client watches.
+func (h *Hub) detachAll(c *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for roomID := range c.rooms {
+		h.detachRoomLocked(c, roomID)
+	}
+}
+
+// detachRoomLocked drops one watch entry. Caller holds the hub lock.
+func (h *Hub) detachRoomLocked(c *Client, roomID int64) {
+	delete(c.rooms, roomID)
+	if set, ok := h.byRoom[roomID]; ok {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(h.byRoom, roomID)
+		}
+	}
 }
 
 // sendToRoom queues an envelope for every client watching a room.
@@ -425,20 +459,24 @@ func describeError(err error) ErrorView {
 		return ErrorView{Code: "room_full", Message: "该对局已满"}
 	case errors.Is(err, gamehall.ErrNotASeat):
 		return ErrorView{Code: "not_seated", Message: "你不在这个对局中"}
+	case errors.Is(err, gamehall.ErrGameInProgress):
+		return ErrorView{Code: "game_in_progress", Message: "对局已开始，先下完这一局"}
 	case errors.Is(err, gamehall.ErrNotYourTurn):
 		return ErrorView{Code: "not_your_turn", Message: "还没轮到你走棋"}
+	case errors.Is(err, gamehall.ErrGameFinished):
+		return ErrorView{Code: "finished", Message: "对局已结束"}
+	case errors.Is(err, gamehall.ErrGameNotStarted):
+		return ErrorView{Code: "not_started", Message: "双方准备后对局才开始"}
+	case errors.Is(err, gamehall.ErrNothingPending):
+		return ErrorView{Code: "nothing_pending", Message: "没有待处理的请求"}
+	case errors.Is(err, game.ErrGameOver):
+		return ErrorView{Code: "finished", Message: "对局已结束"}
 	case errors.Is(err, game.ErrIllegalMove):
-		return ErrorView{Code: "illegal_move", Message: "不能这样走"}
+		return ErrorView{Code: "illegal_move", Message: "不能这样走，被将军时必须应将"}
 	case errors.Is(err, game.ErrNoSuchPiece):
 		return ErrorView{Code: "no_piece", Message: "该位置没有棋子"}
 	case errors.Is(err, game.ErrWrongSide):
 		return ErrorView{Code: "wrong_side", Message: "不能移动对方的棋子"}
-	case errors.Is(err, gamehall.ErrGameFinished):
-		return ErrorView{Code: "finished", Message: "对局已结束"}
-	case errors.Is(err, gamehall.ErrGameNotStarted):
-		return ErrorView{Code: "not_started", Message: "对局还没开始"}
-	case errors.Is(err, gamehall.ErrNothingPending):
-		return ErrorView{Code: "nothing_pending", Message: "没有待处理的请求"}
 	default:
 		if err == nil {
 			return ErrorView{Code: "unknown", Message: "未知错误"}

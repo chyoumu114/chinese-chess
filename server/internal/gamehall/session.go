@@ -24,13 +24,20 @@ var (
 	ErrNotYourTurn    = errors.New("gamehall: it is not your turn")
 	ErrGameFinished   = errors.New("gamehall: the game has finished")
 	ErrGameNotStarted = errors.New("gamehall: the game has not started")
+	ErrGameInProgress = errors.New("gamehall: the game is already under way")
 	ErrNothingPending = errors.New("gamehall: there is no pending offer")
 	ErrSameSeat       = errors.New("gamehall: cannot play against yourself")
 )
 
 // Status values for a room.
+//
+// A room walks through them in one direction, with a single step backwards:
+// waiting (one seat free) → ready (both seats taken, waiting for 准备) → playing
+// → finished. A finished room returns to ready when both players accept a
+// rematch, so the same room hosts game after game until somebody leaves.
 const (
 	StatusWaiting  = "waiting"
+	StatusReady    = "ready"
 	StatusPlaying  = "playing"
 	StatusFinished = "finished"
 )
@@ -149,6 +156,10 @@ type Seat struct {
 	TurnDeadline time.Time
 	// MoveCount counts the plies this seat has played.
 	MoveCount int
+	// Ready records that this player accepted the next game by pressing 准备.
+	// It is cleared when the game starts. A seat held by the computer is always
+	// considered ready.
+	Ready bool
 }
 
 // SideName renders a side as the wire string.
@@ -216,9 +227,29 @@ func (r *Room) SideOf(userID int64) (game.Side, bool) {
 	return game.Red, false
 }
 
-// BothSeated reports whether the room has two players.
-func (r *Room) BothSeated() bool {
-	return r.Red.UserID != 0 && r.Black.UserID != 0
+// Filled reports whether both seats are occupied, by a player or by the
+// computer. A seat taken by the computer is taken, so this — and not "are there
+// two human UserIDs" — is what answers "is there room for another player".
+func (r *Room) Filled() bool {
+	return (r.Red.UserID != 0 || r.Red.IsAI) && (r.Black.UserID != 0 || r.Black.IsAI)
+}
+
+// Occupied reports whether anybody at all is still in the room. It is what
+// decides whether a room survives a departure.
+func (r *Room) Occupied() bool {
+	return r.Red.UserID != 0 || r.Black.UserID != 0 || r.Red.IsAI || r.Black.IsAI
+}
+
+// sideReady reports whether a side has accepted the next game. The computer
+// always has.
+func (r *Room) sideReady(side game.Side) bool {
+	seat := r.SeatFor(side)
+	return seat.Ready || seat.IsAI
+}
+
+// BothReady reports whether both sides accepted the next game.
+func (r *Room) BothReady() bool {
+	return r.sideReady(game.Red) && r.sideReady(game.Black)
 }
 
 // Session owns every live room. All exported methods are safe for concurrent
@@ -314,19 +345,26 @@ type JoinRequest struct {
 
 // Join seats a player, creating a room when necessary, and returns the room id
 // and the side they were given.
+//
+// A player who is already seated keeps that seat, unless the request asks for a
+// different room or for a game their current room cannot offer. Asking for
+// another seat therefore implicitly leaves the old one.
 func (s *Session) Join(ctx context.Context, req JoinRequest) (int64, game.Side, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// A player already seated somewhere is returned to that seat rather than
-	// being given a second game.
-	if existing, ok := s.byUser[req.UserID]; ok && req.UserID != 0 {
-		r := s.rooms[existing]
-		if r != nil && r.Status != StatusFinished {
-			if side, ok := r.SideOf(req.UserID); ok {
-				r.SeatFor(side).Connected = true
-				s.notify([]int64{r.ID})
-				return r.ID, side, nil
+	if req.UserID != 0 {
+		if existing, ok := s.byUser[req.UserID]; ok {
+			if r := s.rooms[existing]; r != nil {
+				side, seated := r.SideOf(req.UserID)
+				if seated && resumable(r, req) {
+					r.SeatFor(side).Connected = true
+					s.notify([]int64{r.ID})
+					return r.ID, side, nil
+				}
+				// Free the old seat first: a player holds exactly one seat, and
+				// walking away from a running game is a loss for them.
+				s.leaveLocked(ctx, existing, req.UserID)
 			}
 		}
 	}
@@ -338,6 +376,22 @@ func (s *Session) Join(ctx context.Context, req JoinRequest) (int64, game.Side, 
 		return s.joinAI(req)
 	}
 	return s.joinMatchmaking(req)
+}
+
+// resumable reports whether an existing seat satisfies a join request, so a
+// reconnect or a duplicate join returns the player to the game they are in.
+//
+// A quick match deliberately does not resume a finished room: the player asked
+// for an opponent, not to stare at the board of a game that is over.
+func resumable(r *Room, req JoinRequest) bool {
+	switch {
+	case req.RoomID != 0:
+		return r.ID == req.RoomID
+	case req.AILevel != 0:
+		return r.Status != StatusFinished && (r.Red.IsAI || r.Black.IsAI)
+	default:
+		return r.Status != StatusFinished
+	}
 }
 
 // joinSpecific seats a player in a named room.
@@ -355,7 +409,7 @@ func (s *Session) joinSpecific(req JoinRequest) (int64, game.Side, error) {
 		s.notify([]int64{r.ID})
 		return r.ID, side, nil
 	}
-	if r.BothSeated() {
+	if r.Filled() {
 		return 0, game.Red, ErrRoomFull
 	}
 	side := game.Red
@@ -363,7 +417,7 @@ func (s *Session) joinSpecific(req JoinRequest) (int64, game.Side, error) {
 		side = game.Black
 	}
 	s.seat(r, side, req.UserID, req.Name, false, 0)
-	s.startLocked(r)
+	s.advanceLocked(r)
 	s.notify([]int64{r.ID})
 	return r.ID, side, nil
 }
@@ -374,26 +428,31 @@ func (s *Session) joinMatchmaking(req JoinRequest) (int64, game.Side, error) {
 		id := s.waiting[0]
 		s.waiting = s.waiting[1:]
 		r, ok := s.rooms[id]
-		if !ok || r.Status != StatusWaiting || r.BothSeated() {
+		if !ok || r.Status != StatusWaiting || r.Filled() {
 			continue
 		}
-		if r.Red.UserID == req.UserID {
+		if r.Red.UserID != 0 && r.Red.UserID == req.UserID {
 			continue
 		}
-		s.seat(r, game.Black, req.UserID, req.Name, false, 0)
-		s.startLocked(r)
+		side := game.Red
+		if r.Red.UserID != 0 {
+			side = game.Black
+		}
+		s.seat(r, side, req.UserID, req.Name, false, 0)
+		s.advanceLocked(r)
 		s.notify([]int64{r.ID})
-		return r.ID, game.Black, nil
+		return r.ID, side, nil
 	}
 
 	r := s.newRoomLocked(req.Rated)
 	s.seat(r, game.Red, req.UserID, req.Name, false, 0)
-	s.waiting = append(s.waiting, r.ID)
+	s.enqueueWaitingLocked(r)
 	s.notify([]int64{r.ID})
 	return r.ID, game.Red, nil
 }
 
-// joinAI opens a room whose opponent is the computer.
+// joinAI opens a room whose opponent is the computer. The computer is always
+// ready, so such a game starts as soon as it is created.
 func (s *Session) joinAI(req JoinRequest) (int64, game.Side, error) {
 	r := s.newRoomLocked(req.Rated)
 
@@ -409,7 +468,7 @@ func (s *Session) joinAI(req JoinRequest) (int64, game.Side, error) {
 
 	s.seat(r, humanSide, req.UserID, req.Name, false, 0)
 	s.seat(r, aiSide, 0, fmt.Sprintf("电脑（%s）", req.AILevel), true, req.AILevel)
-	s.startLocked(r)
+	s.beginLocked(r, false)
 	s.notify([]int64{r.ID})
 	return r.ID, humanSide, nil
 }
@@ -452,29 +511,211 @@ func (s *Session) seat(r *Room, side game.Side, userID int64, name string, isAI 
 	}
 }
 
-// startLocked begins play. A room needs both seats filled, and it needs either
-// two human players or a player facing the computer. A seat taken by the
-// computer counts as filled, so a game against the computer starts the moment
-// it is created; a room posted for matchmaking must keep waiting for an
-// opponent. Caller holds the lock.
-func (s *Session) startLocked(r *Room) {
-	if r.Status != StatusWaiting {
-		return
+// advanceLocked recomputes the state of a room that is not in play, from who is
+// seated and who has pressed 准备. It reports whether a game started and whether
+// that game is a rematch of the previous one. Caller holds the lock.
+//
+// Two human players both have to accept before the pieces move: joining a room
+// only fills a seat, it never starts a game on its own.
+func (s *Session) advanceLocked(r *Room) (started, restarted bool) {
+	if r.Status == StatusPlaying {
+		return false, false
 	}
-	hasAI := r.Red.IsAI || r.Black.IsAI
-	if hasAI {
-		if r.Red.UserID == 0 && r.Black.UserID == 0 {
-			return
+	if !r.Filled() {
+		if r.Status != StatusFinished {
+			r.Status = StatusWaiting
 		}
-	} else if !r.BothSeated() {
-		return
+		return false, false
 	}
+	// Somebody is in both seats from here on, so the room stops being an open
+	// invitation in the lobby.
+	s.removeFromWaitingLocked(r.ID)
+	if !r.BothReady() {
+		if r.Status != StatusFinished {
+			r.Status = StatusReady
+		}
+		return false, false
+	}
+	restarted = r.Status == StatusFinished
+	s.beginLocked(r, restarted)
+	return true, restarted
+}
 
+// beginLocked puts a room into play. restart asks for a fresh game in the same
+// room, with the two seats trading colours. Caller holds the lock.
+func (s *Session) beginLocked(r *Room, restart bool) {
+	if restart {
+		s.resetLocked(r, true)
+	}
 	r.Status = StatusPlaying
 	r.StartedAt = s.cfg.Now()
+	r.Red.Ready = false
+	r.Black.Ready = false
 	s.armClockLocked(r)
 	s.removeFromWaitingLocked(r.ID)
 	s.startRecorderLocked(r)
+}
+
+// resetLocked prepares a room for its next game. When swap is true the two seats
+// trade colours, which is what "再来一局换边" means. Caller holds the lock.
+//
+// The persisted game id is cleared as well: the next game is a new row in the
+// games table, because one room can host many games in a row.
+func (s *Session) resetLocked(r *Room, swap bool) {
+	if swap {
+		r.Red, r.Black = r.Black, r.Red
+	}
+	now := s.cfg.Now()
+	r.Game = game.NewGame()
+	r.Moves = nil
+	r.Result = nil
+	r.HasDrawOffer = false
+	r.DrawOfferedBy = game.Red
+	r.HasTakebackRequest = false
+	r.TakebackRequestedBy = game.Red
+	r.aiThinking = false
+	r.PersistedID = 0
+	r.StartedAt = time.Time{}
+	r.CreatedAt = now
+	for _, side := range []game.Side{game.Red, game.Black} {
+		seat := r.SeatFor(side)
+		seat.Ready = false
+		seat.MoveCount = 0
+		seat.MSLeft = s.cfg.GameTimeout.Milliseconds()
+		seat.TurnDeadline = time.Time{}
+		seat.JoinedAt = now
+	}
+}
+
+// ReadyOutcome reports what pressing 准备 did.
+type ReadyOutcome struct {
+	// Started is true when this press started the game.
+	Started bool
+	// Restarted is true when the game that started is a rematch in a room whose
+	// previous game had already finished; the seats have swapped colours.
+	Restarted bool
+	// Reopened is true when the opponent had already left, so instead of
+	// starting, the room went back to the lobby waiting for a new opponent.
+	Reopened bool
+}
+
+// Ready records that a seated player accepts the next game. As soon as both
+// sides have accepted the room starts — or restarts, after a finished game, in
+// which case the two players swap colours and stay in the same room.
+//
+// Pressing 准备 in a finished room whose opponent has left reopens the room for
+// matchmaking, so a player is never stuck in front of an empty board.
+func (s *Session) Ready(ctx context.Context, roomID, userID int64) (ReadyOutcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, ok := s.rooms[roomID]
+	if !ok {
+		return ReadyOutcome{}, ErrRoomNotFound
+	}
+	side, ok := r.SideOf(userID)
+	if !ok {
+		return ReadyOutcome{}, ErrNotASeat
+	}
+	if r.Status == StatusPlaying {
+		return ReadyOutcome{}, ErrGameInProgress
+	}
+
+	r.SeatFor(side).Ready = true
+	out := ReadyOutcome{}
+	out.Started, out.Restarted = s.advanceLocked(r)
+	if !out.Started && r.Status == StatusFinished && !r.Filled() {
+		// Alone in a room whose game is over: reopen it instead of leaving the
+		// player in front of an empty board. The acceptance just given outlives
+		// the reset, so a newcomer only has to accept in turn.
+		s.resetLocked(r, false)
+		r.SeatFor(side).Ready = true
+		r.Status = StatusWaiting
+		s.enqueueWaitingLocked(r)
+		out.Reopened = true
+	}
+	s.notify([]int64{r.ID})
+	return out, nil
+}
+
+// LeaveOutcome reports what leaving a room did.
+type LeaveOutcome struct {
+	RoomID int64
+	// Dissolved is true when the room was dropped because nobody was left in it.
+	Dissolved bool
+	// Result is set when leaving ended a game that was still running.
+	Result *Result
+}
+
+// Leave frees the caller's seat. It is idempotent: leaving a room that is gone,
+// or that the caller is not seated in, does nothing.
+//
+// Leaving a room whose opponent is still there ends a running game as abandoned
+// (the player who walked away loses) and keeps whatever the game had reached.
+// Leaving the last seat dissolves the room, which is how a cancelled quick match
+// stops showing up in the lobby.
+func (s *Session) Leave(ctx context.Context, roomID, userID int64) LeaveOutcome {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leaveLocked(ctx, roomID, userID)
+}
+
+// leaveLocked is Leave with the lock already held, so Join can hand a seat back
+// before taking another one. Caller holds the lock.
+func (s *Session) leaveLocked(ctx context.Context, roomID, userID int64) LeaveOutcome {
+	out := LeaveOutcome{RoomID: roomID}
+	r, ok := s.rooms[roomID]
+	if !ok {
+		return out
+	}
+	side, ok := r.SideOf(userID)
+	if !ok {
+		return out
+	}
+
+	// A game that is still running is abandoned: the opponent wins and the
+	// result is recorded before the seat is handed back, because the rating
+	// exchange needs both user ids.
+	if r.Status == StatusPlaying {
+		_ = r.Game.Abandon(side)
+		out.Result = s.finishLocked(ctx, r)
+	}
+
+	s.vacateLocked(r, side)
+	s.removeFromWaitingLocked(r.ID)
+
+	if !r.Occupied() {
+		delete(s.rooms, r.ID)
+		out.Dissolved = true
+	} else if r.Status != StatusFinished {
+		// The opponent is still here but the game never started, so the room
+		// goes back to the lobby instead of pretending to be ready.
+		r.Status = StatusWaiting
+		s.enqueueWaitingLocked(r)
+	}
+	s.notify([]int64{roomID})
+	return out
+}
+
+// vacateLocked empties a seat, keeping the other seat intact, and clears the
+// player index so the user is free to take another seat. Caller holds the lock.
+func (s *Session) vacateLocked(r *Room, side game.Side) {
+	seat := r.SeatFor(side)
+	if seat.UserID != 0 && s.byUser[seat.UserID] == r.ID {
+		delete(s.byUser, seat.UserID)
+	}
+	*seat = Seat{MSLeft: s.cfg.GameTimeout.Milliseconds()}
+}
+
+// enqueueWaitingLocked advertises a room as open for an opponent, without
+// listing it twice. Caller holds the lock.
+func (s *Session) enqueueWaitingLocked(r *Room) {
+	for _, id := range s.waiting {
+		if id == r.ID {
+			return
+		}
+	}
+	s.waiting = append(s.waiting, r.ID)
 }
 
 // startRecorderLocked tells the recorder the game is under way.
@@ -673,11 +914,19 @@ func (s *Session) applyMoveLocked(ctx context.Context, r *Room, side game.Side, 
 // finishLocked records the result of a finished room and returns it. The result
 // is always returned, even when no recorder is installed, so callers can report
 // the outcome and the final position. Caller holds the lock.
+//
+// The two players deliberately keep their seats: a finished room is where a
+// rematch happens, so both users stay bound to it until they leave.
 func (s *Session) finishLocked(ctx context.Context, r *Room) *Result {
 	r.Status = StatusFinished
 	r.Red.TurnDeadline = time.Time{}
 	r.Black.TurnDeadline = time.Time{}
-	s.byUserDelete(r)
+	// A pending offer dies with the game: leaving it set would make the client
+	// keep asking for an answer to a request that no longer means anything.
+	r.HasDrawOffer = false
+	r.DrawOfferedBy = game.Red
+	r.HasTakebackRequest = false
+	r.TakebackRequestedBy = game.Red
 
 	winnerSide := ""
 	if side, ok := r.Game.Winner(); ok {
@@ -720,7 +969,7 @@ func (s *Session) finishLocked(ctx context.Context, r *Room) *Result {
 	return res
 }
 
-// byUserDelete clears the user-to-room index for a finished room.
+// byUserDelete clears the user-to-room index for a room that is going away.
 func (s *Session) byUserDelete(r *Room) {
 	for _, id := range []int64{r.Red.UserID, r.Black.UserID} {
 		if id != 0 && s.byUser[id] == r.ID {
@@ -1064,6 +1313,9 @@ func seatView(s Seat, side string) PlayerView {
 		AILevel:   int(s.AILevel),
 		MSLeft:    maxInt64(s.MSLeft, 0),
 		MoveCount: s.MoveCount,
+		// A seat played by the computer is always ready for the next game, so
+		// the client can render readiness without special-casing the engine.
+		Ready: s.Ready || s.IsAI,
 	}
 }
 
@@ -1121,7 +1373,8 @@ func (s *Session) OpenRooms() []OpenRoom {
 }
 
 // ReapFinished drops old finished rooms so the process does not grow without
-// bound. It returns how many were removed.
+// bound. It returns how many were removed. Because a finished room keeps its
+// players seated until they leave, their user index entries go with it.
 func (s *Session) ReapFinished(maxAge time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1131,6 +1384,8 @@ func (s *Session) ReapFinished(maxAge time.Duration) int {
 	for id, r := range s.rooms {
 		if r.Status == StatusFinished && r.StartedAt.Before(cutoff) && r.CreatedAt.Before(cutoff) {
 			delete(s.rooms, id)
+			s.byUserDelete(r)
+			s.removeFromWaitingLocked(id)
 			removed++
 		}
 	}

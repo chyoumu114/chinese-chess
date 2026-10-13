@@ -37,6 +37,52 @@ func TestPlayRejectsMovesThePieceCannotMake(t *testing.T) {
 	}
 }
 
+// TestCheckedSideMustAnswerTheCheck pins the 应将 rule: while a king is attacked
+// only the moves that break the attack are legal. Any other move would leave the
+// king in check (送将) and must be rejected, whichever piece makes it — including
+// the piece that squares are traded for.
+func TestCheckedSideMustAnswerTheCheck(t *testing.T) {
+	cases := []struct {
+		name string
+		// fen is a position in which Red is to move and in check.
+		fen string
+		// ignore does not answer the check and must be rejected.
+		ignore string
+		// answer breaks the check and must be accepted.
+		answer string
+	}{
+		{
+			name:   "rook check down the file",
+			fen:    "3k5/9/9/4r4/9/9/9/9/9/R3K4 w - - 0 1",
+			ignore: "a9a3",
+			answer: "e9f9",
+		},
+		{
+			name:   "cannon check through a screen far from the king",
+			fen:    "3k5/9/9/9/4c4/9/9/4P4/9/4K4 w - - 0 1",
+			ignore: "e7e6",
+			answer: "e9f9",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g, err := NewGameFromFEN(c.fen)
+			if err != nil {
+				t.Fatalf("position %q is invalid: %v", c.fen, err)
+			}
+			if !g.InCheck() {
+				t.Fatalf("Red should be in check in %s", c.fen)
+			}
+			if _, err := g.Play(Move{From: sq(t, c.ignore[:2]), To: sq(t, c.ignore[2:])}); err == nil {
+				t.Errorf("%s leaves the king in check and must be rejected", c.ignore)
+			}
+			if _, err := g.Play(Move{From: sq(t, c.answer[:2]), To: sq(t, c.answer[2:])}); err != nil {
+				t.Errorf("%s answers the check and must be accepted: %v", c.answer, err)
+			}
+		})
+	}
+}
+
 // TestPlayAgreesWithLegalMoves checks every move the generator offers is
 // accepted, and no other move is. This is the strongest statement of the
 // invariant the bug above violated.

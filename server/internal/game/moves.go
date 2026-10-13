@@ -234,9 +234,9 @@ func (b *Board) kingsFacing() bool {
 //
 // Scanning one direction at a time matters: pieces on opposite sides of the
 // target must never be combined into a single screen. Within one direction the
-// first piece met can be a rook or king that attacks the square directly, or a
-// screen behind which a cannon attacks; likewise a cannon of the attacking side
-// standing first with a second attacking piece behind it attacks the square.
+// first piece met can be a rook or king that attacks the square directly, a pawn
+// that attacks it from an adjacent square, or a screen behind which a cannon
+// attacks.
 func (b *Board) raysFrom(row, col int, attacking Side) bool {
 	for _, d := range orthogonal {
 		var first, second Piece
@@ -258,6 +258,7 @@ func (b *Board) raysFrom(row, col int, attacking Side) bool {
 		if first.Side == attacking {
 			switch first.Type {
 			case Rook:
+				// Nothing stands between the rook and the target.
 				return true
 			case King:
 				// The opposing king bears on an adjacent square; the
@@ -265,26 +266,23 @@ func (b *Board) raysFrom(row, col int, attacking Side) bool {
 				if abs(firstSq.Row()-row)+abs(firstSq.Col()-col) == 1 {
 					return true
 				}
-			case Cannon:
-				// A cannon attacks when exactly one piece separates it from the
-				// target, and here the cannon itself is that first piece, so the
-				// screen must be immediately next to the target with nothing in
-				// between.
-				if second.Type != NoPiece &&
-					abs(firstSq.Row()-row)+abs(firstSq.Col()-col) == 2 {
-					return true
-				}
 			case Pawn:
 				if pawnAttacks(first, firstSq, NewSquare(row, col)) {
 					return true
 				}
 			}
+			// A cannon standing closest attacks nothing here: it needs exactly
+			// one piece between it and its target, and the scan found none.
 		}
-		// A cannon of the attacking side standing immediately beyond a screen
-		// also bears on the target: the screen is the first piece met and must
-		// be adjacent to the target.
-		if second.Side == attacking && second.Type == Cannon &&
-			abs(firstSq.Row()-row)+abs(firstSq.Col()-col) == 1 {
+		// A cannon of the attacking side attacks when exactly one piece lies
+		// strictly between it and the target — the screen is the first piece met
+		// in this direction and the cannon is the next one. The empty squares on
+		// either side of the screen are irrelevant: a cannon jumps over exactly
+		// one piece and may stand any distance away, so the screen need not be
+		// adjacent to the target. Requiring adjacency here would silently miss a
+		// cannon check, which would let the checked side answer with a move that
+		// ignores the check.
+		if second.Side == attacking && second.Type == Cannon {
 			return true
 		}
 	}

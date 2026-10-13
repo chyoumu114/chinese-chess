@@ -164,6 +164,24 @@ func (c *Client) handle(env Envelope) {
 		}
 		c.handleJoin(ctx, req)
 
+	case TypeReady:
+		c.withRoom(func(roomID int64) {
+			out, err := c.hub.session.Ready(ctx, roomID, c.identity.UserID)
+			if err != nil {
+				c.enqueue(NewEnvelope(TypeError, describeError(err)))
+				return
+			}
+			if out.Started {
+				// A game that starts now needs its own row in the games table,
+				// and the computer may be the first to move.
+				c.hub.persistIfPlaying(ctx, roomID)
+				c.hub.requestAIMoveIfNeeded(ctx, roomID)
+			}
+		})
+
+	case TypeLeave:
+		c.handleLeave(ctx)
+
 	case TypeMove:
 		c.withRoom(func(roomID int64) {
 			var req MoveRequest
@@ -337,8 +355,10 @@ func (c *Client) handleJoin(ctx context.Context, req JoinRequest) {
 		return
 	}
 
-	// Persist the game row the first time a room is actually used.
-	c.hub.ensurePersisted(ctx, roomID)
+	// Persist the game row once the room is actually in play. A room that is
+	// still waiting for an opponent, or for 准备, must not leave a half-written
+	// game behind when its match is cancelled.
+	c.hub.persistIfPlaying(ctx, roomID)
 
 	c.hub.attachRoom(c, roomID)
 	view, ok := c.hub.session.View(roomID)
@@ -354,6 +374,52 @@ func (c *Client) handleJoin(ctx context.Context, req JoinRequest) {
 	// The computer may already be to move, for example when the human chose to
 	// play Black.
 	c.hub.requestAIMoveIfNeeded(ctx, roomID)
+}
+
+// handleLeave frees the caller's seat. The opponent, if there is one, is told
+// why the game stopped; a room nobody is left in is dissolved, so cancelling a
+// quick match does not leave an empty room in the lobby.
+func (c *Client) handleLeave(ctx context.Context) {
+	if c.identity.UserID == 0 {
+		c.enqueue(NewEnvelope(TypeError, ErrorView{
+			Code: "login_required", Message: "请先登录再开始对局",
+		}))
+		return
+	}
+
+	roomID, ok := c.hub.session.RoomIDForUser(c.identity.UserID)
+	if !ok {
+		// Nothing to give up, but the client still needs an answer so it can
+		// move on, and the roster may have changed while it was watching.
+		c.hub.detachAll(c)
+		c.enqueue(NewEnvelope(TypeLeft, LeftView{}))
+		c.hub.sendPresence()
+		return
+	}
+
+	// Detach before leaving: the snapshot the departure publishes must not reach
+	// the client that has just left the room.
+	c.hub.detachRoom(c, roomID)
+	out := c.hub.session.Leave(ctx, roomID, c.identity.UserID)
+	c.enqueue(NewEnvelope(TypeLeft, LeftView{RoomID: roomID, Dissolved: out.Dissolved}))
+
+	if out.Result != nil {
+		// Somebody is still in the room: tell them the game is over and why.
+		c.hub.announceResult(roomID, out.Result)
+		c.hub.sendToRoom(roomID, NewEnvelope(TypeOpponentLeft, map[string]any{
+			"roomId": roomID, "name": c.identity.Name, "left": true,
+		}))
+	}
+	c.hub.sendPresence()
+}
+
+// persistIfPlaying creates the games row for a room that is in play.
+func (h *Hub) persistIfPlaying(ctx context.Context, roomID int64) {
+	view, ok := h.session.View(roomID)
+	if !ok || view.Status != gamehall.StatusPlaying {
+		return
+	}
+	h.ensurePersisted(ctx, roomID)
 }
 
 // handleMove applies a move and fans the result out.

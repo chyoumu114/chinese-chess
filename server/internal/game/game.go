@@ -346,6 +346,17 @@ func (g *Game) Timeout(side Side) error {
 	return nil
 }
 
+// Abandon ends the game because a side left the room. Walking out of a running
+// game counts as a loss, and it is recorded with its own reason so the opponent
+// is told why the game stopped rather than reading it as a resignation.
+func (g *Game) Abandon(side Side) error {
+	if g.Over() {
+		return ErrGameOver
+	}
+	g.setWin(side.Opponent(), ReasonAbandoned)
+	return nil
+}
+
 // Draw ends the game as a draw, recording the agreed reason.
 func (g *Game) Draw(reason Reason) error {
 	if g.Over() {

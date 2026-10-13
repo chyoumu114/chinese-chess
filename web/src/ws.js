@@ -199,6 +199,13 @@ export const ws = new WsClient()
 // Convenience wrappers so views read like the protocol table.
 export const protocol = {
   join: (payload = {}) => ws.send('join', payload),
+  // ready accepts the next game. Two human players both have to send it before
+  // the pieces move; after a finished game it starts a rematch in the same room
+  // with the colours swapped.
+  ready: () => ws.send('ready'),
+  // leave gives up the current seat: it cancels a quick match, or forfeits a
+  // running game. The server answers with a `left` frame.
+  leave: () => ws.send('leave'),
   move: (from, to) => ws.send('move', { from, to }),
   resign: () => ws.send('resign'),
   offerDraw: () => ws.send('offer_draw'),

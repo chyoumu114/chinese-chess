@@ -14,6 +14,9 @@ type PlayerView struct {
 	AILevel   int    `json:"aiLevel,omitempty"`
 	MSLeft    int64  `json:"msLeft"`
 	MoveCount int    `json:"moveCount"`
+	// Ready is true once this side has pressed 准备 for the next game. A seat
+	// played by the computer always reports true.
+	Ready bool `json:"ready"`
 }
 
 // MoveView is one played ply as sent to clients.

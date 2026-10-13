@@ -132,6 +132,62 @@ func (c *checker) run() error {
 	}
 	defer bobConn.close()
 
+	// 4b. A quick match can be cancelled: leaving the only seat dissolves the
+	// room instead of leaving an empty invitation in the lobby.
+	dave, err := c.register(fmt.Sprintf("dave%d", suffix), "戴夫")
+	if err != nil {
+		return c.fail("register dave: %w", err)
+	}
+	daveConn, err := c.dial(dave.Token, "dave")
+	if err != nil {
+		return c.fail("dave websocket: %w", err)
+	}
+	defer daveConn.close()
+
+	if err := daveConn.send("join", nil); err != nil {
+		return c.fail("dave join: %w", err)
+	}
+	daveRoom, err := daveConn.waitFor("room", 10*time.Second)
+	if err != nil {
+		return c.fail("dave waiting for room: %w", err)
+	}
+	if daveRoom.Room.Status != "waiting" {
+		return c.fail("dave should be waiting alone, status = %q", daveRoom.Room.Status)
+	}
+	if err := daveConn.send("leave", nil); err != nil {
+		return c.fail("dave leave: %w", err)
+	}
+	if _, err := daveConn.waitFor("left", 10*time.Second); err != nil {
+		return c.fail("leaving a waiting room was not acknowledged: %w", err)
+	}
+	open, err := c.openRoomIDs(dave.Token)
+	if err != nil {
+		return c.fail("lobby after leaving: %w", err)
+	}
+	if containsID(open, daveRoom.Room.ID) {
+		return c.fail("room %d is still advertised after its only player left", daveRoom.Room.ID)
+	}
+	// The player is free to match again straight away.
+	if err := daveConn.send("join", nil); err != nil {
+		return c.fail("dave rejoin: %w", err)
+	}
+	again, err := daveConn.waitFor("room", 10*time.Second)
+	if err != nil {
+		return c.fail("dave rejoin room: %w", err)
+	}
+	if again.Room.ID == daveRoom.Room.ID {
+		return c.fail("dave was given the dissolved room %d again", daveRoom.Room.ID)
+	}
+	if err := daveConn.send("leave", nil); err != nil {
+		return c.fail("dave second leave: %w", err)
+	}
+	// Wait for the acknowledgement: the room must be gone before the next player
+	// matches, or that player would be seated as its second player.
+	if _, err := daveConn.waitFor("left", 10*time.Second); err != nil {
+		return c.fail("dave's second leave was not acknowledged: %w", err)
+	}
+	c.logf("✓ a quick match can be cancelled: room %d was dissolved and the player could match again", daveRoom.Room.ID)
+
 	if err := aliceConn.send("join", nil); err != nil {
 		return c.fail("alice join: %w", err)
 	}
@@ -161,17 +217,44 @@ func (c *checker) run() error {
 	if bobRoom.Room.YouAre != "black" {
 		return c.fail("the second player should be black, got %q", bobRoom.Room.YouAre)
 	}
-	if bobRoom.Room.Status != "playing" {
-		return c.fail("the game should be playing, status = %q", bobRoom.Room.Status)
+	// Both players are seated, but the game must NOT have started: it waits for
+	// both of them to accept it.
+	if bobRoom.Room.Status != "ready" {
+		return c.fail("two seated players should be ready to confirm, status = %q", bobRoom.Room.Status)
 	}
-	if bobRoom.Room.Turn != "red" {
-		return c.fail("red should move first, turn = %q", bobRoom.Room.Turn)
+	if len(bobRoom.Room.LegalFrom) != 0 {
+		return c.fail("a room that has not started must not publish legal moves")
 	}
-	c.logf("✓ bob seated in the same room as black; game is playing")
+	c.logf("✓ bob seated in the same room as black; both players must confirm")
+
+	// 5b. One 准备 is not enough; the second one starts the game.
+	if err := aliceConn.send("ready", nil); err != nil {
+		return c.fail("alice ready: %w", err)
+	}
+	if _, err := aliceConn.waitForRoomWhere(10*time.Second, func(r roomSnapshot) bool { return r.Red.Ready }); err != nil {
+		return c.fail("alice readiness was not published: %w", err)
+	}
+	if _, err := aliceConn.waitForStatus("playing", 2*time.Second); err == nil {
+		return c.fail("the game started with only one player ready")
+	}
+	if err := bobConn.send("ready", nil); err != nil {
+		return c.fail("bob ready: %w", err)
+	}
+	started, err := bobConn.waitForStatus("playing", 10*time.Second)
+	if err != nil {
+		return c.fail("both players were ready but the game did not start: %w", err)
+	}
+	if started.Room.Turn != "red" {
+		return c.fail("red should move first, turn = %q", started.Room.Turn)
+	}
+	if started.Room.Red.Ready || started.Room.Black.Ready {
+		return c.fail("the ready flags must be cleared once the game starts")
+	}
+	c.logf("✓ 双方准备后才开始对局（单人准备不会开局）")
 
 	// 6. The server publishes the legal moves, and there must be 44 of them.
 	total := 0
-	for _, dests := range bobRoom.Room.LegalFrom {
+	for _, dests := range started.Room.LegalFrom {
 		total += len(dests)
 	}
 	if total != 44 {
@@ -312,6 +395,59 @@ func (c *checker) run() error {
 	}
 	c.logf("✓ winner stats updated: rating %d, wins %d", me.User.Rating, me.User.Wins)
 
+	// 11b. Both players 准备 for a rematch: the SAME room starts a new game with
+	// the colours swapped, and the rematch is a new record rather than a
+	// continuation of the finished one.
+	if err := aliceConn.send("ready", nil); err != nil {
+		return c.fail("alice ready for a rematch: %w", err)
+	}
+	if _, err := aliceConn.waitForRoomWhere(10*time.Second, func(r roomSnapshot) bool { return r.Red.Ready }); err != nil {
+		return c.fail("alice's rematch readiness was not published: %w", err)
+	}
+	if _, err := aliceConn.waitForStatus("playing", 2*time.Second); err == nil {
+		return c.fail("a rematch started with only one player ready")
+	}
+	if err := bobConn.send("ready", nil); err != nil {
+		return c.fail("bob ready for a rematch: %w", err)
+	}
+	rematch, err := aliceConn.waitForStatus("playing", 10*time.Second)
+	if err != nil {
+		return c.fail("the rematch did not start: %w", err)
+	}
+	if rematch.Room.ID != roomID {
+		return c.fail("the rematch moved to room %d, want the same room %d", rematch.Room.ID, roomID)
+	}
+	if rematch.Room.YouAre != "black" {
+		return c.fail("alice should hold black after the swap, got %q", rematch.Room.YouAre)
+	}
+	if rematch.Room.Red.Name != "鲍勃" || rematch.Room.Black.Name != "爱丽丝" {
+		return c.fail("the colours did not swap: red=%q black=%q", rematch.Room.Red.Name, rematch.Room.Black.Name)
+	}
+	if len(rematch.Room.Moves) != 0 {
+		return c.fail("the rematch kept %d plies from the previous game", len(rematch.Room.Moves))
+	}
+	if rematch.Room.Turn != "red" || len(rematch.Room.LegalFrom) == 0 {
+		return c.fail("the rematch is not a fresh game: turn=%q legal=%d", rematch.Room.Turn, len(rematch.Room.LegalFrom))
+	}
+	if rematch.Room.Red.Ready || rematch.Room.Black.Ready {
+		return c.fail("the ready flags must be cleared by the rematch")
+	}
+	c.logf("✓ 同一房间换边再来一局：alice 改执黑，棋盘重置为开局")
+
+	// The rematch is a separate game row: the history now holds the finished
+	// game and the one just started.
+	games, err = c.listMine(alice.Token)
+	if err != nil {
+		return c.fail("list my games after the rematch: %w", err)
+	}
+	if len(games) < 2 {
+		return c.fail("the rematch did not create a new game record, history has %d rows", len(games))
+	}
+	if games[0].Status != "playing" {
+		return c.fail("the newest game row should be playing, got %q", games[0].Status)
+	}
+	c.logf("✓ 再来一局另起一条棋谱记录（历史共 %d 条）", len(games))
+
 	// 12. The AI endpoint answers with a legal move for the opening.
 	var aiResp struct {
 		From     string `json:"from"`
@@ -349,6 +485,9 @@ func (c *checker) run() error {
 	}
 	if aiRoom.Room.Status != "playing" {
 		return c.fail("a game against the computer should start immediately, status = %q", aiRoom.Room.Status)
+	}
+	if aiRoom.Room.Black.Ready != true {
+		return c.fail("the computer's seat must always report ready: %+v", aiRoom.Room.Black)
 	}
 	if err := carolConn.send("move", map[string]string{"from": "b7", "to": "e7"}); err != nil {
 		return c.fail("carol move: %w", err)
@@ -430,6 +569,33 @@ func (c *checker) listMine(token string) ([]storedGame, error) {
 	return out.Games, nil
 }
 
+// openRoomIDs lists the room ids the lobby advertises as waiting.
+func (c *checker) openRoomIDs(token string) ([]int64, error) {
+	var lobby struct {
+		OpenRooms []struct {
+			ID int64 `json:"id"`
+		} `json:"openRooms"`
+	}
+	if err := c.getJSON("/api/lobby", token, &lobby); err != nil {
+		return nil, err
+	}
+	out := make([]int64, 0, len(lobby.OpenRooms))
+	for _, r := range lobby.OpenRooms {
+		out = append(out, r.ID)
+	}
+	return out, nil
+}
+
+// containsID reports whether an id list holds a value.
+func containsID(ids []int64, id int64) bool {
+	for _, v := range ids {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *checker) getJSON(path, token string, out any) error {
 	req, err := http.NewRequest(http.MethodGet, c.base+path, nil)
 	if err != nil {
@@ -490,37 +656,41 @@ func (c *checker) do(req *http.Request, out any) error {
 
 // frame is one server-to-client message, decoded lazily by type.
 type frame struct {
-	Type string `json:"type"`
-	Room struct {
-		ID      int64  `json:"id"`
-		Status  string `json:"status"`
-		Turn    string `json:"turn"`
-		YouAre  string `json:"youAre"`
-		FEN     string `json:"fen"`
-		Outcome string `json:"outcome"`
-		Red     struct {
-			Name   string `json:"name"`
-			IsAI   bool   `json:"isAI"`
-			Online bool   `json:"online"`
-		} `json:"red"`
-		Black struct {
-			Name   string `json:"name"`
-			IsAI   bool   `json:"isAI"`
-			Online bool   `json:"online"`
-		} `json:"black"`
-		LegalFrom map[string][]string `json:"legalFrom"`
-		Moves     []struct {
-			Ply      int    `json:"ply"`
-			Notation string `json:"notation"`
-		} `json:"moves"`
-	} `json:"-"`
-	Raw json.RawMessage `json:"data"`
-	// Decoded payloads.
+	Type     string          `json:"type"`
+	Room     roomSnapshot    `json:"-"`
+	Raw      json.RawMessage `json:"data"`
 	GameOver struct {
 		Outcome    string `json:"outcome"`
 		Reason     string `json:"reason"`
 		WinnerSide string `json:"winnerSide"`
 	} `json:"-"`
+}
+
+// roomSnapshot is the part of a room view the acceptance script inspects. It
+// carries `ready` because two human players have to confirm before play starts.
+type roomSnapshot struct {
+	ID        int64               `json:"id"`
+	Status    string              `json:"status"`
+	Turn      string              `json:"turn"`
+	YouAre    string              `json:"youAre"`
+	FEN       string              `json:"fen"`
+	Outcome   string              `json:"outcome"`
+	LegalFrom map[string][]string `json:"legalFrom"`
+	Red       seatSnapshot        `json:"red"`
+	Black     seatSnapshot        `json:"black"`
+	Moves     []struct {
+		Ply      int    `json:"ply"`
+		Notation string `json:"notation"`
+	} `json:"moves"`
+}
+
+// seatSnapshot is one seat of a room view.
+type seatSnapshot struct {
+	UserID int64  `json:"userId"`
+	Name   string `json:"name"`
+	IsAI   bool   `json:"isAI"`
+	Online bool   `json:"online"`
+	Ready  bool   `json:"ready"`
 }
 
 // wsClient wraps a connection with a reader goroutine that decodes frames.
@@ -635,4 +805,48 @@ func (w *wsClient) waitFor(kind string, timeout time.Duration) (frame, error) {
 			return frame{}, fmt.Errorf("%s: connection closed while waiting for %q (saw %v)", w.name, kind, seen)
 		}
 	}
+}
+
+// waitForRoomWhere waits for a room snapshot that satisfies pred. Snapshots that
+// do not match are consumed and skipped, so a caller can wait for a state that is
+// only reached after several updates.
+func (w *wsClient) waitForRoomWhere(timeout time.Duration, pred func(roomSnapshot) bool) (frame, error) {
+	deadline := time.After(timeout)
+	var seen []string
+	for {
+		select {
+		case d, ok := <-w.frames:
+			if !ok {
+				return frame{}, fmt.Errorf("%s: connection closed while waiting for a room snapshot (saw %v)", w.name, seen)
+			}
+			seen = append(seen, d.kind)
+			if d.kind == "error" {
+				var ev struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				}
+				_ = json.Unmarshal(d.payload, &ev)
+				return frame{}, fmt.Errorf("%s: server error while waiting for a room snapshot: %s (%s)", w.name, ev.Message, ev.Code)
+			}
+			if d.kind != "room" {
+				continue
+			}
+			var f frame
+			f.Type = d.kind
+			f.Raw = d.raw
+			_ = json.Unmarshal(d.payload, &f.Room)
+			if pred == nil || pred(f.Room) {
+				return f, nil
+			}
+		case <-deadline:
+			return frame{}, fmt.Errorf("%s: timed out waiting for a room snapshot (saw %v)", w.name, seen)
+		case <-w.closed:
+			return frame{}, fmt.Errorf("%s: connection closed while waiting for a room snapshot (saw %v)", w.name, seen)
+		}
+	}
+}
+
+// waitForStatus waits for a room snapshot in a given status.
+func (w *wsClient) waitForStatus(status string, timeout time.Duration) (frame, error) {
+	return w.waitForRoomWhere(timeout, func(r roomSnapshot) bool { return r.Status == status })
 }
