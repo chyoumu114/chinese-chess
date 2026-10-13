@@ -1,9 +1,12 @@
-# 生产覆盖层：镜像改为从阿里云 ACR 拉取，且不对外暴露数据库端口。
+# 生产覆盖层：镜像改为从阿里云 ACR 拉取，数据库只绑宿主机回环（公网不可达）。
+#
+# 回环上留一个 3306，是为了让 SSH 隧道（Navicat / DBeaver / `ssh -L`）能进来；
+# 隧道把 sshd 当跳板，鉴权走 SSH，比把 3306 丢给公网安全得多。
 #
 #   cd deploy
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
-# ⚠️ 为什么必须用 !reset 标签，而不能写 `ports: []`：
+# ⚠️ 为什么必须用 !reset / !override 标签，而不能写 `ports: []`：
 #
 #   Compose 合并多个文件时，列表类型（ports、volumes、secrets、configs）
 #   默认是「追加」而不是「替换」。写 `ports: []` 清不掉基础文件里的端口——
@@ -14,8 +17,12 @@
 #     !override 完全替换该属性，绕过标准合并规则
 services:
   mysql:
-    # 移除基础文件里的端口映射：生产环境数据库只在容器网络内可达。
-    ports: !reset []
+    # 只绑宿主机回环：公网访问不到（安全组也永远不要放行 3306），
+    # 但服务器本机可以，SSH 隧道随之可用。
+    # 这里用 !override 把值写死，而不是让它继承基础文件里的 ${MYSQL_BIND}：
+    # 万一哪天 .env 里 MYSQL_BIND 被改成 0.0.0.0，数据库就直接暴露在公网上了。
+    ports: !override
+      - "127.0.0.1:3306:3306"
 
   server:
     # 移除继承来的 build 段：生产只拉取 CI 构建好的镜像，不在服务器上编译。

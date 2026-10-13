@@ -76,7 +76,8 @@ docker compose up -d --build  # 连后端一起起，一条命令跑通整站
 
 凭据全部来自 `deploy/.env`（已被 `.gitignore` 忽略，切勿提交），
 变量缺失时 Compose 会立即报错，不会用错配置静默启动。
-生产环境叠加覆盖层，从 ACR 拉镜像且不暴露数据库端口：
+生产环境叠加覆盖层，从 ACR 拉镜像，数据库只绑宿主机回环
+（公网不可达，SSH 隧道可连）：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d

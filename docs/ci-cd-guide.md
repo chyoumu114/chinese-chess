@@ -260,7 +260,9 @@ sudo ufw allow 8080/tcp        # 若用 ufw
 # 云控制台安全组入方向加一条：TCP 8080，授权对象 0.0.0.0/0
 ```
 
-**3306 不要对外开放**。`docker-compose.prod.yml` 已用 `!reset []` 去掉了数据库端口映射，安全组层面也别开。
+**3306 不要对外开放**。`docker-compose.prod.yml` 用 `!override` 把数据库端口
+**写死绑在 `127.0.0.1`**，只在宿主机回环上；安全组层面也别开。
+要从外面连库，走 SSH 隧道，见 8.4。
 
 ### 7.3 完整部署
 
@@ -319,6 +321,69 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 | 健康检查超时但容器已起来 | 云厂商**安全组**没放行 8080 |
 | 容器起不来，日志显示 ping 失败 | MySQL 未就绪；检查 `depends_on: service_healthy` 是否还在 |
 | 想确认线上到底跑的是哪个版本 | 见附 A 末尾的"如何验证部署真的生效" |
+
+---
+
+### 8.4 用 Navicat 连生产数据库（走 SSH 隧道）
+
+生产库只绑在服务器回环上（见 `docker-compose.prod.yml`），所以：
+**不要去安全组放行 3306**，正确姿势是把 sshd 当跳板。
+
+Navicat 里建连接，两个页面填完即可：
+
+| 页面 | 字段 | 值 |
+|---|---|---|
+| 常规 | 主机 / 端口 | `127.0.0.1` / `3306`（**从服务器视角**解析，出口就是回环） |
+| 常规 | 用户名 / 密码 | `root` / `deploy/.env` 里的 `MYSQL_ROOT_PASSWORD` |
+| SSH | 主机 / 端口 | `<服务器IP>` / `22` |
+| SSH | 用户名 | `root` |
+| SSH | 验证方法 | 公钥 → 选 `xiangqi_deploy` 私钥 |
+
+> Navicat 是 Windows 程序，而部署私钥在 WSL 里（`~/.ssh/xiangqi_deploy`），
+> 需要先放一份到 Windows 侧：
+>
+> ```powershell
+> Copy-Item \\wsl.localhost\Ubuntu-24.04\home\administrator\.ssh\xiangqi_deploy `
+>   "$env:USERPROFILE\.ssh\xiangqi_deploy"
+> ```
+>
+> 老版本 Navicat 只认 `.pem` / `.ppk`，那就用 PuTTYgen 把 OpenSSH 私钥
+> 转成 `.ppk` 再选。
+
+**命令行等价物**（不想在 Navicat 里配密钥时用这个）：
+
+```bash
+# WSL 里执行，保持前台运行
+ssh -N -L 13306:127.0.0.1:3306 -i ~/.ssh/xiangqi_deploy root@<服务器IP>
+```
+
+然后 Navicat 直连 `127.0.0.1:13306`（不勾 SSH 隧道）。
+
+**root 账号的说明**：MySQL 官方镜像建的是 `root@'%'`，而不只是
+`root@localhost`，所以从 docker-proxy 转发进来（源 IP 是网桥网关）的连接
+能通过。核对一下：
+
+```bash
+docker exec xiangqi-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" \
+  -e "SELECT user, host FROM mysql.user"
+```
+
+万一没有 `root@'%'`，补一个（在容器里执行）：
+
+```sql
+CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '<MYSQL_ROOT_PASSWORD>';
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+```
+
+> **安全提醒**：`root@'%'` + SSH 隧道等价于「拿到这台服务器的 SSH 就等于
+> 拿到整个数据库」。日常查数据建议用业务账号 `xiangqi`（只有 `xiangqi.*`），
+> 只有改表结构、看 `performance_schema` 时才用 root。
+> 无论如何，3306 都不要出现在安全组的入方向规则里。
+
+> 改了 `docker-compose.prod.yml` 的端口后要重新部署（或服务器上手动
+> `docker compose ... up -d`）才会重建 mysql 容器；数据在 `mysql-data`
+> 卷里，重建不丢。
 
 ---
 

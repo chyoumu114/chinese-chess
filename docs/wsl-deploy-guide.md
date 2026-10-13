@@ -432,16 +432,21 @@ XIANGQI_IMAGE=xiangqi:dev
 >
 > 另外注意：基础文件已把 MySQL 端口绑在 `127.0.0.1`，**默认就不对外**，
 > 所以生产环境其实不必靠覆盖层来"关端口"——这属于"默认安全"设计。
-> 下面的写法只是把意图显式化，避免日后有人改了默认值。
+>
+> 但这里选择把端口**显式写死回环**而不是 `!reset []`：既保留「默认安全」，
+> 又给 SSH 隧道留了一个入口——要连生产库就用 Navicat 的 SSH 隧道，
+> 见 [ci-cd-guide.md](ci-cd-guide.md) 的阶段 8.4。
 
 ```yaml
-# 生产覆盖层：镜像从阿里云 ACR 拉取，且不对外暴露数据库端口
+# 生产覆盖层：镜像从阿里云 ACR 拉取，数据库只绑宿主机回环
 #
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 services:
   mysql:
-    # 用 !reset 移除基础文件里的端口声明（官方规范原例就是 !reset []）
-    ports: !reset []
+    # 写死回环，而不是 !reset []：宿主机留一个 127.0.0.1:3306，
+    # SSH 隧道（Navicat / DBeaver）才进得来；公网依然不可达。
+    ports: !override
+      - "127.0.0.1:3306:3306"
 
   server:
     # 用 !reset 移除继承来的 build 段，只拉取 CI 产出的镜像
