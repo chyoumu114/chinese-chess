@@ -411,8 +411,13 @@ func (g *Game) Undo() (MoveRecord, bool) {
 	}
 	rec := g.history[len(g.history)-1]
 	g.history = g.history[:len(g.history)-1]
-	entry := g.records[len(g.records)-1]
-	g.records = g.records[:len(g.records)-1]
+	// records 只服务记谱，而 AI 与 perft 走的 ApplyUnchecked 只写 history，两者的
+	// 长度可能不一致。这里必须各自判空，否则在搜索里回退会越界 panic。
+	entry := MoveRecord{}
+	if len(g.records) > 0 {
+		entry = g.records[len(g.records)-1]
+		g.records = g.records[:len(g.records)-1]
+	}
 	g.dropPosition()
 
 	g.board.Turn = rec.turn

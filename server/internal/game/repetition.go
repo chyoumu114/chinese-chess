@@ -2,16 +2,15 @@ package game
 
 // 本文件实现局面重复的裁决：长将、长捉与不变作和。
 //
-// 中国象棋竞赛规则把「单方长将」「单方长捉」列为不变作负的行为，落到工程上是
-// 三件事：
+// 中国象棋竞赛规则把「单方长将」「单方长捉」列为不变作负的行为。落地时它由两个
+// 条件的**同时成立**决定：
 //
-//  1. 判重 —— 局面键只取「棋子摆放 + 走子方」，不含半步数与回合数，所以同一个
-//     局面无论绕多少圈、花了多少回合，都是同一个键；
-//  2. 归责 —— 某个局面第三次出现时，取最近一个循环（该键上一次出现到这一次之间
-//     的全部着法），看谁每一步都在将军（长将）或每一步都在威胁白吃对方一个大子
-//     （长捉）；
-//  3. 裁决 —— 只有一方长将或长捉，该方判负；双方都长将/长捉，或双方都不变，
-//     判和。
+//  1. 局面确实在来回重复 —— 当前局面在本局至少出现过第二次，说明双方在绕圈，
+//     而不是一路攻杀（一路将军直到将死是允许的）；
+//  2. 某一方连续将军或连续捉子到 perpetualLimit 次 —— 门槛刻意抬高到 5 次，
+//     两三个回合的重复更像正常的中局纠缠，不该直接判负。
+//
+// 只有同时满足才判该方负；双方都不变（或都长将、都长捉）判和。
 //
 // 记录刻意用自己的一份 marks，而不是复用 records：AI 与 perft 走棋用的是
 // ApplyUnchecked，它只动棋盘、不追加 records。若判重依赖 records 的下标，就会
@@ -19,6 +18,13 @@ package game
 
 // boardSquares 是棋盘格数；局面键多一位用来存走子方。
 const boardSquares = Rows * Cols
+
+// perpetualLimit 是「长将 / 长捉」判负所需的连续步数。
+//
+// 取 5 而非 3 是刻意的：象棋里两三个回合的重复（兑子、抢先手）非常常见，用三次重复
+// 直接判负会把正常的中局纠缠误杀。连续 5 次仍然每一步都在将军（或每一步都在追捉
+// 同一个无根大子），才说明是在靠重复消耗对手。
+const perpetualLimit = 5
 
 // positionKey 是局面的紧凑键：90 个格子的棋子编码 + 走子方，可直接用作 map 键。
 type positionKey [boardSquares + 1]byte
@@ -51,8 +57,8 @@ type RepetitionVerdict struct {
 	Reason  Reason
 	// Loser 是判负的一方；判和时无意义，调用方应以 Outcome 为准。
 	Loser Side
-	// Cycle 是触发裁决的循环长度（步数），便于测试与排障。
-	Cycle int
+	// Streak 是触发裁决时的连续将军（或连续捉子）次数，仅用于测试与排障。
+	Streak int
 }
 
 // initTracking 建立判重所需的初始记录：当前局面记为第一次出现。所有构造 Game
@@ -96,93 +102,107 @@ func (g *Game) dropPosition() {
 	g.seen[mark.key]--
 }
 
-// Repetition 检查当前局面是否已因三次重复而应当终局。它不修改 Game，因此 AI 在
-// 搜索里也能安全地调用它判断某条线路会不会把自己走成长将判负。
+// Repeated reports whether the current position has already occurred in this game.
+// It is the cheap half of the repetition check, and the AI uses it to back off
+// from a loop before the verdict can even fire.
+func (g *Game) Repeated() bool {
+	if g.seen == nil || len(g.marks) == 0 {
+		return false
+	}
+	return g.seen[g.marks[len(g.marks)-1].key] >= 2
+}
+
+// Repetition 检查当前局面是否已因长将 / 长捉 / 三次重复而应当终局。它不修改 Game，
+// 因此 AI 在搜索里也能安全地调用它判断某条线路会不会把自己走死。
 func (g *Game) Repetition() RepetitionVerdict {
 	if g.seen == nil || len(g.marks) == 0 {
 		return RepetitionVerdict{}
 	}
-	last := g.marks[len(g.marks)-1]
-	if g.seen[last.key] < 3 {
+	// 前提：局面在来回重复。一路攻杀（没有重复）时无论将军多少次都合法。
+	repeats := g.seen[g.marks[len(g.marks)-1].key]
+	if repeats < 2 {
 		return RepetitionVerdict{}
 	}
-	// 上一个同局面的位置：两者之间就是一个完整的循环。
-	prev := -1
-	for i := len(g.marks) - 2; i >= 0; i-- {
-		if g.marks[i].key == last.key {
-			prev = i
+
+	redChecks := g.consecutiveChecks(Red)
+	blackChecks := g.consecutiveChecks(Black)
+	switch {
+	case redChecks >= perpetualLimit && blackChecks < perpetualLimit:
+		return RepetitionVerdict{true, OutcomeBlackWin, ReasonPerpetualCheck, Red, redChecks}
+	case blackChecks >= perpetualLimit && redChecks < perpetualLimit:
+		return RepetitionVerdict{true, OutcomeRedWin, ReasonPerpetualCheck, Black, blackChecks}
+	}
+
+	// 长捉要回放中间局面，比数将军贵，所以只在没人在长将时才算。
+	redChases, blackChases := 0, 0
+	if redChecks < perpetualLimit && blackChecks < perpetualLimit {
+		redChases = g.consecutiveChases(Red)
+		blackChases = g.consecutiveChases(Black)
+		switch {
+		case redChases >= perpetualLimit && blackChases < perpetualLimit:
+			return RepetitionVerdict{true, OutcomeBlackWin, ReasonPerpetualChase, Red, redChases}
+		case blackChases >= perpetualLimit && redChases < perpetualLimit:
+			return RepetitionVerdict{true, OutcomeRedWin, ReasonPerpetualChase, Black, blackChases}
+		}
+	}
+
+	if repeats < 3 {
+		return RepetitionVerdict{}
+	}
+	// 有一方还在长将 / 长捉（只是次数没数满）时不要判和：否则它会在数到 5 之前
+	// 被"和棋"提前截断，规则就永远用不上了。
+	redBusy := redChecks >= 2 || redChases >= 2
+	blackBusy := blackChecks >= 2 || blackChases >= 2
+	if redBusy != blackBusy {
+		return RepetitionVerdict{}
+	}
+	// 双方都不变，或者双方都在长将 / 长捉：不变作和。
+	return RepetitionVerdict{true, OutcomeDraw, ReasonRepetition, Red, repeats}
+}
+
+// consecutiveChecks 从最后一步往回数，某一方连续将军了多少次。中间隔着对方的应将
+// 步，只数这一方自己的步子。
+func (g *Game) consecutiveChecks(side Side) int {
+	n := 0
+	for i := len(g.marks) - 1; i >= 0; i-- {
+		if g.marks[i].side != side {
+			continue
+		}
+		if !g.marks[i].check {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// consecutiveChases 报告某一方最近连续多少步走完之后都在「捉」对方。中间局面已经
+// 不在棋盘上，所以先悔棋回到足够早的位置，再正向重放逐个数。
+func (g *Game) consecutiveChases(side Side) int {
+	rewind := perpetualLimit * 2
+	if rewind > len(g.marks) {
+		rewind = len(g.marks)
+	}
+	probe := g.Clone()
+	for i := 0; i < rewind; i++ {
+		if _, ok := probe.Undo(); !ok {
 			break
 		}
 	}
-	if prev < 0 {
-		// 当前局面只在开头出现过（marks 不含开局），两次出现不足以裁决。
-		return RepetitionVerdict{}
-	}
-	cycle := g.marks[prev+1:]
-	if len(cycle) == 0 {
-		return RepetitionVerdict{}
-	}
-
-	redSteps, blackSteps := 0, 0
-	redChecks, blackChecks := 0, 0
-	for _, mark := range cycle {
-		if mark.side == Red {
-			redSteps++
-			if mark.check {
-				redChecks++
-			}
-			continue
-		}
-		blackSteps++
-		if mark.check {
-			blackChecks++
-		}
-	}
-	// 「每一步都在将军」才算长将；某一方在循环里一步未走则不成立。
-	redPerpetual := redSteps > 0 && redChecks == redSteps
-	blackPerpetual := blackSteps > 0 && blackChecks == blackSteps
-
-	switch {
-	case redPerpetual && !blackPerpetual:
-		return RepetitionVerdict{true, OutcomeBlackWin, ReasonPerpetualCheck, Red, len(cycle)}
-	case blackPerpetual && !redPerpetual:
-		return RepetitionVerdict{true, OutcomeRedWin, ReasonPerpetualCheck, Black, len(cycle)}
-	case redPerpetual && blackPerpetual:
-		// 双方都长将：不变作和。
-		return RepetitionVerdict{true, OutcomeDraw, ReasonRepetition, Red, len(cycle)}
-	}
-
-	redChase := redSteps > 0 && g.cycleChases(cycle, Red)
-	blackChase := blackSteps > 0 && g.cycleChases(cycle, Black)
-	switch {
-	case redChase && !blackChase:
-		return RepetitionVerdict{true, OutcomeBlackWin, ReasonPerpetualChase, Red, len(cycle)}
-	case blackChase && !redChase:
-		return RepetitionVerdict{true, OutcomeRedWin, ReasonPerpetualChase, Black, len(cycle)}
-	}
-	// 双方都不变、都长捉：不变作和。
-	return RepetitionVerdict{true, OutcomeDraw, ReasonRepetition, Red, len(cycle)}
-}
-
-// cycleChases 报告某一方在循环里的每一步之后是否都在「捉」对方。中间局面已经不在
-// 棋盘上，所以先悔棋回到循环起点，再正向重放检查。
-func (g *Game) cycleChases(cycle []plyMark, side Side) bool {
-	probe := g.Clone()
-	for range cycle {
-		if _, ok := probe.Undo(); !ok {
-			return false
-		}
-	}
-	for _, mark := range cycle {
+	count := 0
+	for i := len(g.marks) - rewind; i < len(g.marks); i++ {
+		mark := g.marks[i]
 		probe.ApplyUnchecked(mark.move)
 		if mark.side != side {
 			continue
 		}
-		if !probe.chases(side) {
-			return false
+		if probe.chases(side) {
+			count++
+		} else {
+			count = 0
 		}
 	}
-	return true
+	return count
 }
 
 // chases 报告 side 是否正威胁白吃对方一个大子：存在一步合法着法能吃掉对方的

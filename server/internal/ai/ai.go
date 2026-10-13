@@ -152,6 +152,14 @@ func negamax(g *game.Game, depth, alpha, beta int, deadline time.Time) int {
 		}
 		return mateScore + depth
 	}
+	if g.Repeated() {
+		// The position has already occurred: score it as a draw and look for
+		// progress elsewhere. The search is far too shallow to see five
+		// consecutive checks (or the third repetition), so backing off here is
+		// what keeps the computer from walking into a perpetual-check loss —
+		// which is exactly how it managed to lose to its own rule.
+		return 0
+	}
 	if depth <= 0 || time.Now().After(deadline) {
 		return evaluate(g)
 	}
