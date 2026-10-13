@@ -1,388 +1,414 @@
-# CI/CD 篇：从 Gitee 到多服务器自动发布
+# 部署与发布篇：从本地代码到多台服务器
 
 > 承接 [wsl-deploy-guide.md](wsl-deploy-guide.md)（阶段 0～2：本地环境）。
-> 本篇覆盖**阶段 5～8**：代码托管、镜像构建、多服务器发布、运维。
->
-> 阶段 3（配置外部化）已在阶段 2 一并落地；阶段 4（IDE 调试）单独成篇。
+> 本篇覆盖**阶段 5～8**：Git 托管、镜像构建推送、多服务器部署、回滚与密钥轮换。
 
 ---
 
-## 0. 架构总览与设计原则
-
-### 为什么是这套组合
-
-你的机器上 `github.com` 与 `registry-1.docker.io` 直连超时，而代理"只在要用时才开"。
-所以架构的核心目标是：**把一切依赖国际网络的环节都推到云端，本地开发不需要代理。**
+## 0. 整体架构
 
 ```
-本地 WSL                          Gitee 服务器              GitHub 云端            阿里云
-────────                          ───────────              ───────────            ──────
-git push  ──── 国内直连 ────────►  Gitee 仓库
-                                    │
-                                    │ 仓库镜像管理（Gitee 服务器去推，本地不参与）
-                                    ▼
-                                  GitHub 镜像仓库
-                                    │
-                                    │ push 事件触发
-                                    ▼
-                                  GitHub Actions ──── 构建镜像 ────►  ACR 镜像仓库
-                                    │                                    │
-                                    │ SSH 部署（Actions 出网）             │
-                                    ▼                                    │
-                                  服务器 1 / 2 / N  ◄──── docker pull ────┘
+本地 WSL                        Gitee             阿里云 ACR            服务器
+────────                        ─────             ──────────            ──────
+改代码 ──► git push ──────────► 仓库
+
+bash scripts/deploy.sh v1.0.0
+   ├─ docker build ───────────────────────────► 推送镜像
+   └─ ssh 逐台部署 ─────────────────────────────────────────────────► compose pull
+                                                                      compose up -d
+                                                                      健康检查
 ```
 
-每一段的网络归属：
-
-| 环节 | 谁在执行 | 需要本地代理吗 |
-|---|---|---|
-| `git push` 到 Gitee | 你的 WSL | 不需要（国内直连） |
-| Gitee → GitHub 镜像 | Gitee 服务器 | 不需要 |
-| Actions 拉代码、跑测试 | GitHub runner | 不需要 |
-| 构建镜像、推 ACR | GitHub runner | 不需要 |
-| 服务器拉镜像 | 你的服务器 | 不需要（ACR 国内） |
-
-结论：**本地唯一的网络要求是能 push 到 Gitee。**
+一条命令完成：**构建 → 推送私有仓库 → 逐台滚动更新 → 健康检查**。
 
 ### 三条设计原则
 
-1. **镜像只构建一次，所有服务器拉同一个 tag。**
-   多机版本绝对一致，不存在"这台编译出来的和那台不一样"。
-
-2. **配置的唯一事实来源是仓库 Secrets。**
-   服务器上的 `deploy/.env` 由 CI 生成，不手工维护，改密码只改一处。
-
-3. **服务器上不放源码。**
-   只有编排文件和 `.env`，镜像从 ACR 拉。
+1. **镜像只构建一次**，所有服务器拉同一个 tag —— 多机版本绝对一致，不存在"这台编译出来的和那台不一样"。
+2. **运行时镜像全部来自自己的 ACR** —— 不依赖 Docker Hub，也不依赖任何公共加速器的缓存策略。
+3. **凭据分层** —— 仓库里只有模板；真实值在本地 `deploy/.env.deploy` 和服务器 `deploy/.env`，两者都被 gitignore。
 
 ---
 
-## 阶段 5：Git 仓库初始化与 Gitee 托管
+## 阶段 5：Git 仓库与 Gitee 托管
 
-### 5.1 本地初始化
+### 5.1 准备 SSH 密钥
+
+Git 操作在 **WSL 里**执行（代码在 WSL 的 ext4 上，跨文件系统操作 NTFS 上的仓库又慢又容易出权限问题）。如果 Windows 侧已配过 Gitee，直接复用：
+
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+cp /mnt/c/Users/<你的用户名>/.ssh/id_ed25519     ~/.ssh/
+cp /mnt/c/Users/<你的用户名>/.ssh/id_ed25519.pub ~/.ssh/
+
+# 关键：NTFS 挂载出来的权限是 777，SSH 会拒绝，必须收紧
+chmod 600 ~/.ssh/id_ed25519
+chmod 644 ~/.ssh/id_ed25519.pub
+
+# 验证
+ssh -o StrictHostKeyChecking=accept-new -T git@gitee.com
+```
+
+### 5.2 初始化与提交
 
 ```bash
 cd ~/projects/chinese-chess
-
-# 确认 .gitignore 已覆盖敏感文件（本项目已配好）
-grep -nE '^\.env|^deploy/\.env' .gitignore
+git config --global user.name  "你的名字"
+git config --global user.email "你的邮箱"
 
 git init -b main
 git add .
-git status --short        # 关键：确认 deploy/.env 不在列表里！
+git commit -m "初始提交"
 ```
 
-> **这一步必须停下来检查**：如果 `git status` 里出现 `.env`，说明
-> `.gitignore` 没生效，先把真实凭据撤出来。提交一个密码到远端仓库，
-> 即使随后删除，历史里也永远留着。
+### 5.3 ⚠️ 提交前的安全检查（最关键的一步）
+
+`git status --short` 对**未跟踪的目录只显示目录名**，`?? deploy/` 并不会展开里面的文件。所以必须专门验证：
 
 ```bash
-git -c user.name="你的名字" -c user.email="你的邮箱" commit -m "初始提交：象棋对战平台"
+# ① 精确检查 .env 是否被忽略（有输出=已忽略）
+git check-ignore -v deploy/.env
+
+# ② 展开全部未跟踪文件，扫一遍敏感关键词
+git status --short --untracked-files=all | grep -iE "\.env|secret|password|credential|\.key$|\.pem$"
 ```
 
-### 5.2 Gitee 建仓并推送
+期望结果：`deploy/.env.example`（模板）出现，`deploy/.env`（真实凭据）**绝不出现**。
 
-在 Gitee 网页端新建仓库（**建议私有**），然后：
+> **一旦密码进了 git 历史，即使随后删除，也能被 clone 的人翻出来。** 这一步比后面所有步骤都重要。
+>
+> 顺带一提，`server/internal/auth/password.go` 会命中 "password" 关键词，但它是**源码**（PBKDF2 口令哈希实现），不是密码文件。
+
+### 5.4 Gitee 建仓与推送
+
+在 Gitee 新建仓库（**建议私有**），**不要勾选任何"初始化仓库"选项**——否则远端有初始提交，本地推送会因历史不一致被拒。
 
 ```bash
 git remote add origin git@gitee.com:<你的账号>/chinese-chess.git
 git push -u origin main
+
+# 确认远程已收到
+git ls-remote --heads origin
 ```
 
-用 SSH 而非 HTTPS：免去每次输密码，也方便后续自动化。
-若还没配 Gitee 的 SSH 公钥，在 Gitee「设置 → SSH 公钥」里添加 `~/.ssh/id_ed25519.pub`。
+### 5.5 行尾策略（.gitattributes）
 
-### 5.3 分支策略
+仓库里已有 `.gitattributes`，核心两行：
 
-单人学习项目，保持简单：
+```
+* text=auto eol=lf
+*.ps1 text eol=crlf
+```
 
-| 分支 | 用途 | 触发什么 |
-|---|---|---|
-| `main` | 稳定可发布 | CI + 打 tag 时发布 |
-| `dev` | 日常开发 | CI |
-| `feature/*` | 临时特性 | 提 PR 时 CI |
+**为什么必须要有**：Windows 版 Git 默认 `core.autocrlf=true`，检出时会把 LF 转成 CRLF。若用 Windows 侧工具（如 SourceTree）操作 WSL 里的仓库，shell 脚本会变成 CRLF，在 Linux 里执行时报：
 
-日常在 `dev` 上开发，稳定后合并到 `main`。
+```
+/bin/bash^M: bad interpreter: No such file or directory
+```
 
----
-
-## 阶段 6：Gitee → GitHub 镜像
-
-### 6.1 为什么需要这一步
-
-Gitee 仓库上跑不了 GitHub Actions。你的诉求是"用 Actions 发布"，而代码
-托管又想留在国内（push 快、不用代理）。镜像同步同时满足两者——
-而且同步动作由 **Gitee 的服务器**发起，你的本地完全不参与。
-
-### 6.2 准备 GitHub 私人令牌（PAT）
-
-1. 在 GitHub 建一个**空的私有仓库**（名字与 Gitee 上一致，不要勾选任何初始化文件）
-2. 访问 GitHub → Settings → Developer settings → Personal access tokens
-3. 新建 **classic token**，勾选权限：
-   - `repo`（必填，否则镜像不可用）
-   - `admin:repo_hook`（勾选后 Gitee 才能自动生成 webhook 实现自动同步）
-4. 复制令牌（只显示一次）
-
-### 6.3 在 Gitee 配置镜像
-
-Gitee 仓库 →「管理」→「仓库镜像管理」→「添加镜像」：
-
-| 项 | 填什么 |
-|---|---|
-| 镜像方向 | **Push**（把 Gitee 推到 GitHub） |
-| 镜像仓库 | 选择你的 GitHub 仓库（首次需先绑定 GitHub 账号） |
-| 私人令牌 | 上一步的 GitHub PAT |
-| 自动同步 | 勾选（否则要手动点「更新」） |
-
-> 参考：[Gitee 官方说明](https://blog.gitee.com/2026/01/23/github-gitee-mirror-sync-one-commit-two-repos/)。
-
-### 6.4 限制（务必知道）
-
-| 限制 | 影响 | 应对 |
-|---|---|---|
-| 最短触发间隔 5 分钟 | 连续推送不会每次都同步 | 合并提交，别频繁小步推送等同步 |
-| 会**覆盖**目标仓库的分支与标签 | GitHub 上的改动会被冲掉 | 永远只在 Gitee 侧改代码 |
-| 不支持 Git-LFS | 大文件会失败 | 本项目无 LFS 需求 |
-| 超过 30 分钟视为超时 | 超大仓库不可用 | 本项目体积很小 |
-
-**验证方式**：在 Gitee 推一个提交，等约 1 分钟，去 GitHub 看 commit 是否出现。
-出现了，就说明主线打通了。
+这个文件让仓库自身声明行尾规则，不依赖各人本机的 git 配置。
 
 ---
 
-## 阶段 7：CI —— 自动跑测试
+## 阶段 6：构建并推送镜像
 
-### 7.1 已落地的文件
+### 6.1 准备 ACR
 
-[.github/workflows/ci.yml](../.github/workflows/ci.yml)
+阿里云「容器镜像服务 ACR」→ 创建**个人版**实例（免费）→ 建命名空间（如 `example-namespace`）→ 建镜像仓库。
 
-两个并行 job：
+记下四项：
 
-| Job | 内容 | 备注 |
+| 项 | 在哪找 | 新版个人版的样子 |
 |---|---|---|
-| `server` | `go vet ./...` + `go test ./... -count=1` | Go 版本从 `server/go.mod` 读，不需要手工同步 |
-| `web` | `npm ci` + `npm test` + `npm run build` | 用 `npm ci` 严格按锁文件安装 |
+| registry 地址 | 实例概览页 | `crpi-xxxxxxxx.cn-shenzhen.personal.cr.aliyuncs.com` |
+| 命名空间 | 左侧「命名空间」 | 自己起的名字 |
+| 登录名 | 「镜像工具」→「访问凭证」 | 阿里云账号全名 |
+| 固定密码 | 同一页面设置 | 自己设的 |
 
-几个刻意的选择：
+> 注意：**新版个人版 ACR 的地址不是** `registry.cn-hangzhou.aliyuncs.com` 那种老格式，而是 `crpi-*.personal.cr.aliyuncs.com`。两者别混。
 
-- **不需要 MySQL service 容器**：`internal/store` 的集成测试在拿不到数据库时
-  会自动跳过，CI 因此更轻更快。
-- **`concurrency` 取消旧任务**：同一分支连续推送时，自动取消上一次未跑完的运行。
-- **`cache-dependency-path` 用仓库根相对路径**：它不受 job 内
-  `working-directory` 影响，写错会让缓存静默失效。
-
-### 7.2 触发方式
-
-- push 到 `main` / `dev`
-- 向 `main` 提 PR
-- 手动触发（Actions 页面 → CI → Run workflow）
-
-镜像同步过来的 commit 同样会触发，这是整条链路的关键一环。
-
----
-
-## 阶段 8：CD —— 构建镜像并发布到多台服务器
-
-### 8.1 准备阿里云 ACR
-
-1. 开通「容器镜像服务 ACR」，选**个人版**（免费）
-2. 创建命名空间，例如 `xiangqi`
-3. 创建镜像仓库，例如 `xiangqi`，类型选**私有**
-4. 设置**固定密码**（访问凭证 → 固定密码），记下：
-   - 登录名（通常是阿里云账号全名）
-   - 固定密码
-
-三个值会分别放进 Secrets：`ACR_REGISTRY`、`ACR_NAMESPACE`、`ACR_USERNAME`、`ACR_PASSWORD`。
-
-> 同一个控制台里还有「镜像加速器」，就是阶段 1 需要的
-> `https://<你的ID>.mirror.aliyuncs.com`，顺手一起取走。
-
-### 8.2 服务器清单
-
-复制模板并填写真实地址：
+### 6.2 本地部署配置
 
 ```bash
-cp deploy/servers.example.json deploy/servers.json
+cd ~/projects/chinese-chess/deploy
+cp .env.deploy.example .env.deploy
+nano .env.deploy        # 填 ACR 四项凭据
+chmod 600 .env.deploy
+```
+
+若服务器拉不动 Docker Hub（见 6.5），再加一行指向私有仓库的 MySQL 镜像：
+
+```ini
+MYSQL_IMAGE=crpi-xxxxxxxx.cn-shenzhen.personal.cr.aliyuncs.com/example-namespace/mysql:8.4
+```
+
+### 6.3 只构建推送（先验证这一步）
+
+```bash
+cd ~/projects/chinese-chess
+bash scripts/deploy.sh v0.1.0 --no-deploy
+```
+
+**先只验证"构建 + 推送"**，不碰服务器。这一环最容易出问题（ACR 权限、命名空间、区域地址、manifest 兼容性），单独验证能快速定位。
+
+成功后去 ACR 控制台的「镜像仓库」应能看到对应 tag。
+
+### 6.4 为什么必须关掉 provenance
+
+`scripts/deploy.sh` 里的构建命令带两个参数，**不是可选优化**：
+
+```bash
+docker build --provenance=false --sbom=false -f deploy/Dockerfile -t "$IMAGE_TAG" .
+```
+
+**原因**：Docker 29 默认启用 containerd 镜像存储，BuildKit 会附带 provenance（构建来源证明）和 SBOM 清单，产出的 manifest 含 `application/vnd.oci.empty.v1+json` 这个 OCI 媒体类型。**阿里云 ACR 不认识它**，推送时层全部成功、最后 manifest 被拒：
+
+```
+error from registry: unknown manifest class for application/vnd.oci.empty.v1+json
+```
+
+关掉这两个附件后推送正常（已实测）。
+
+### 6.5 把 MySQL 镜像也放进私有仓库
+
+服务器的 `docker-compose.prod.yml` 需要 `mysql:8.4`。若服务器拉不动 Docker Hub，就把镜像先推到自己的 ACR：
+
+```bash
+ACR=crpi-xxxxxxxx.cn-shenzhen.personal.cr.aliyuncs.com/example-namespace
+
+docker tag mysql:8.4 $ACR/mysql:8.4
+docker push $ACR/mysql:8.4          # 1.12 GB，较慢，一次性
+```
+
+然后在 `.env.deploy` 里设 `MYSQL_IMAGE`（见 6.2），`deploy.sh` 会自动把它注入服务器端 `.env`。
+
+**这是一次性投资**：之后所有服务器都从私有仓库高速拉取。
+
+---
+
+## 阶段 7：多服务器部署
+
+### 7.1 服务器清单
+
+```bash
+cd ~/projects/chinese-chess/deploy
+cp servers.example.json servers.json
+nano servers.json
 ```
 
 ```json
 [
-  { "name": "prod-1", "host": "你的IP", "port": 22,
+  { "name": "prod-1", "host": "1.2.3.4", "port": 22,
     "user": "root", "app_dir": "/opt/xiangqi" }
 ]
 ```
 
-这个文件**不含密钥**，可以提交入库，用版本控制记录有哪几台机器。
+**不含密钥，可以入库**。加第二台服务器就是往数组里再加一项，无需改脚本。
 
-> 为什么服务器清单放文件、而不是放 Secret：
-> GitHub Actions 的 `secrets` 上下文在 `jobs.<job_id>.strategy` 中并不可靠，
-> `secrets[...]` 动态索引也有争议用法。而 `needs` 输出在 `strategy` 里是
-> 明确可用的，所以工作流先由一个 `prepare` job 读取 JSON 并输出，
-> 再用 `fromJSON(needs.prepare.outputs.servers)` 构造 matrix。
+> 注意这里面有公网 IP。仓库保持私有即可；若日后转公开，先把它移出或加进 `.gitignore`。
 
-### 8.3 Secrets 与 Variables 清单
+### 7.2 服务器首次准备
 
-**Settings → Secrets and variables → Actions**
-
-Secrets（加密，不可回读）：
-
-| 名称 | 用途 | 建议生成方式 |
-|---|---|---|
-| `ACR_REGISTRY` | ACR 地址 | `registry.cn-hangzhou.aliyuncs.com` |
-| `ACR_NAMESPACE` | ACR 命名空间 | 你自己创建的 |
-| `ACR_USERNAME` | ACR 登录名 | 阿里云控制台查看 |
-| `ACR_PASSWORD` | ACR 固定密码 | 阿里云控制台设置 |
-| `DEPLOY_SSH_KEY` | 部署用私钥全文 | 见 8.4 |
-| `MYSQL_ROOT_PASSWORD` | MySQL root 密码 | `openssl rand -hex 32` |
-| `MYSQL_PASSWORD` | 应用账号密码 | `openssl rand -hex 32` |
-| `XIANGQI_JWT_SECRET` | JWT 签名密钥 | `openssl rand -hex 32` |
-
-> **强烈建议全部用 `openssl rand -hex 32` 生成**：结果只含 `0-9a-f`，
-> 写进 `.env` 时不需要任何转义，能绕开引号、`$`、换行引起的各种诡异问题。
-
-Variables（明文，可回读）：
-
-| 名称 | 用途 | 示例 |
-|---|---|---|
-| `XIANGQI_ALLOWED_ORIGINS` | 允许的 WebSocket 来源 | `https://chess.example.com` |
-
-留空表示只允许同源，适合直接用 IP 访问的场景。
-
-### 8.4 生成部署密钥
-
-**在本地生成，不要用你日常登录服务器的那把密钥**——部署密钥泄露时只吊销它：
+**① 生成部署专用密钥**（不要复用 Gitee 那把，职责分离）：
 
 ```bash
 ssh-keygen -t ed25519 -C "xiangqi-deploy" -f ~/.ssh/xiangqi_deploy -N ""
+ssh-copy-id -i ~/.ssh/xiangqi_deploy.pub root@你的服务器
+
+# 验证免密
+ssh -i ~/.ssh/xiangqi_deploy root@你的服务器 'echo 登录成功'
 ```
 
-把**公钥**装到每台服务器：
+**② 装 Docker Engine**（阿里云源，与本地一致）：
 
 ```bash
-ssh-copy-id -i ~/.ssh/xiangqi_deploy.pub root@你的服务器IP
+sudo apt install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://mirrors.aliyun.com/docker-ce/linux/ubuntu \
+$(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io \
+                    docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
 ```
 
-把**私钥全文**（含首尾两行）填入 GitHub Secret `DEPLOY_SSH_KEY`：
+**③ 配镜像加速器**（**服务器上才用阿里云加速器**，见附 A）：
 
 ```bash
-cat ~/.ssh/xiangqi_deploy
+cat > /etc/docker/daemon.json <<'EOF'
+{
+  "registry-mirrors": ["https://<你的ID>.mirror.aliyuncs.com"],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+EOF
+
+systemctl daemon-reload && systemctl restart docker
+docker info | grep -A2 "Registry Mirrors"
 ```
 
-### 8.5 发布工作流解析
-
-[.github/workflows/release.yml](../.github/workflows/release.yml) 分三段：
-
-**① `prepare`** —— 读 `deploy/servers.json`，压成单行 JSON 作为 job 输出。
-文件不存在时只警告并跳过部署，不会让整个流程失败。
-
-**② `build`** —— 登录 ACR → Buildx → 构建并推送。
-镜像 tag 规则：打 tag 触发用 `<tag>-<短sha>`，手动触发可用自定义值。
-用 `cache-from/to: type=gha` 复用构建缓存，重复构建明显变快。
-
-**③ `deploy`** —— matrix 逐台部署，`max-parallel: 1` 串行更新，
-`fail-fast: false` 让某台失败不影响其余。每台执行：
-
-1. 配好 SSH 私钥并预取主机指纹（之后指纹变化会拒绝连接）
-2. 在 runner 本地按 Secrets 生成 `.env`（用 env 中转，避免密码里特殊字符被二次解释）
-3. scp 编排文件与 `.env` 到服务器的 `app_dir/deploy/`
-4. 远端 `docker login` → `compose pull` → `compose up -d` → `image prune`
-5. 远端轮询 `/api/health`，最多等 60 秒
-
-### 8.6 服务器首次准备
-
-每台服务器（Ubuntu 22.04 / 24.04）执行一次：
+**④ 开放端口**：服务器防火墙**和云厂商安全组**都要放行 8080。
 
 ```bash
-# Docker Engine：与本地 WSL 完全相同的安装方式（见 wsl-deploy-guide.md 阶段 1）
-# 装好后确认：
-docker version && docker compose version
-
-# 部署目录
-sudo mkdir -p /opt/xiangqi/deploy
-
-# 开放服务端口（8080 对外；3306 不要开）
-sudo ufw allow 8080/tcp
+sudo ufw allow 8080/tcp        # 若用 ufw
+# 云控制台安全组入方向加一条：TCP 8080，授权对象 0.0.0.0/0
 ```
 
-**首次部署建议手工跑一次**，确认链路通了再交给 CI：
+**3306 不要对外开放**。`docker-compose.prod.yml` 已用 `!reset []` 去掉了数据库端口映射，安全组层面也别开。
+
+### 7.3 完整部署
 
 ```bash
-cd /opt/xiangqi/deploy
-# 手工放一份 .env（可从 CI 生成的格式抄，或本地填好 scp 上来）
-docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-curl -s http://127.0.0.1:8080/api/health
+cd ~/projects/chinese-chess
+bash scripts/deploy.sh v1.0.0
 ```
 
-### 8.7 发布
+### 7.4 脚本做了什么
 
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
+| 步骤 | 内容 |
+|---|---|
+| 1/5 | 检查环境，**校验 docker 是 WSL 原生版**（指向 `/mnt/c/...` 会直接拦下） |
+| 2/5 | 登录 ACR |
+| 3/5 | 构建镜像（带 `--provenance=false --sbom=false`） |
+| 4/5 | 推送镜像 |
+| 5/5 | 逐台：建目录 → scp 编排文件 → 生成服务器 `.env` → 远端 `docker login` + `compose pull/up` → 健康检查（最多 60 秒） |
 
-等 Gitee 镜像同步（约 1 分钟）→ GitHub Actions 自动构建推送 → 逐台部署。
+**几个刻意的设计**：
+
+- **服务器端 `.env` 自动生成**：从 `deploy/.env.prod`（没有则回退 `.env`）派生，但**强制覆盖** `XIANGQI_IMAGE`（指向本次推送的镜像）和 `XIANGQI_ENV=production`，避免忘了改镜像地址而部署了旧版本。
+- **逐台串行 + 失败不中断**：某台挂了不影响其余，最后汇总"成功 N 台，失败 M 台"，有失败则退出码非零。
+- **`--server <name>`** 只部署指定一台；**`--no-deploy`** 只构建推送。
 
 ---
 
-## 运维
+## 阶段 8：运维
 
-### 回滚
+### 8.1 回滚
 
-因为每次发布的镜像都有独立 tag，回滚就是换 tag 重启：
+每个版本都有独立 tag，回滚就是换 tag 重启：
 
 ```bash
 cd /opt/xiangqi/deploy
-sed -i 's|^XIANGQI_IMAGE=.*|XIANGQI_IMAGE=registry.cn-hangzhou.aliyuncs.com/命名空间/xiangqi:v0.9.0|' .env
+sed -i 's|^XIANGQI_IMAGE=.*|XIANGQI_IMAGE=<ACR地址>/<命名空间>/xiangqi:v0.9.0|' .env
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
-> 注意：`sed` 改的是服务器本地 `.env`，下次 CI 部署会覆盖回 Secrets 里的值。
-> 要永久回滚，应该在 GitHub 上重新对旧 commit 打 tag 走一遍流水线。
+> 注意：这是改**服务器本地** `.env`，下次 CI/脚本部署会覆盖回新版本。要永久回滚，应该对旧 commit 重新打 tag 走一遍部署流程。
 
-### 密钥轮换
+### 8.2 密钥轮换
 
 | 密钥 | 轮换步骤 |
 |---|---|
-| MySQL / JWT | 改 GitHub Secrets → 重新触发 Release。注意 JWT 换key会让所有登录态失效 |
-| 部署 SSH 密钥 | 服务器换 `authorized_keys` → 改 `DEPLOY_SSH_KEY` |
-| ACR 密码 | 控制台重置 → 改 `ACR_PASSWORD` |
+| MySQL / JWT | 改本地 `.env`（或 `.env.prod`）→ 重新部署。**换 JWT 会让所有登录态失效** |
+| 部署 SSH 密钥 | 服务器换 `authorized_keys` → 本地换 `~/.ssh/xiangqi_deploy` |
+| ACR 密码 | 控制台重置 → 改 `deploy/.env.deploy` |
 
-### 排查速查
+### 8.3 排查速查
 
 | 现象 | 排查方向 |
 |---|---|
-| GitHub 上没出现新 commit | Gitee 镜像是否配置成功；是否在 5 分钟冷却期内 |
-| Actions 没触发 | 分支是否是 `main`/`dev`；镜像同步是否成功 |
-| 构建失败在 `npm ci` | 本地改了 `package.json` 却没提交 `package-lock.json` |
-| `docker pull` 在服务器失败 | ACR 凭证、镜像 tag 是否存在 |
-| 部署后健康检查超时 | 服务器上 `docker compose logs server`；多半是连不上 MySQL |
-| `Access denied ... CREATE DATABASE` | 覆盖层没生效，`-no-create-db` 丢了 |
+| `deploy.sh` 报找不到 SSH 密钥，路径形如 `/.ssh/xxx` | `.env.deploy` 里的 `~` 丢了，改成绝对路径 |
+| push 报 `unknown manifest class ... oci.empty.v1+json` | 构建缺 `--provenance=false --sbom=false` |
+| 服务器 `mysql:8.4` 拉取超时 | 服务器没配加速器，或加速器缺该镜像 → 用 `MYSQL_IMAGE` 指向私有仓库 |
+| 健康检查超时但容器已起来 | 云厂商**安全组**没放行 8080 |
+| 容器起不来，日志显示 ping 失败 | MySQL 未就绪；检查 `depends_on: service_healthy` 是否还在 |
+| 想确认线上到底跑的是哪个版本 | 见附 A 末尾的"如何验证部署真的生效" |
 
 ---
 
-## Secrets 与配置文件对照总表
+## 附 A：踩坑记录（均为实测）
 
-同一个配置项在三个地方的对应关系（这是"配置外部化"最容易搞混的地方）：
+| 问题 | 根因 | 解法 |
+|---|---|---|
+| 本地拉 `mysql:8.4` 超时 | 未配镜像加速器 | 配 `docker.1ms.run`（本地可用的公共源） |
+| 阿里云加速器返回 **403** | 阿里云限制**非阿里云主机**调用 | 本地换公共源；**服务器（ECS）上不受此限** |
+| 服务器拉 `alpine`/`mysql` 返回 **404** | 加速器端点活着，但恰好不代理这两个镜像 | 把镜像推进自己的 ACR，用 `MYSQL_IMAGE` 指向它 |
+| push 报 `unknown manifest class` | Docker 29 + containerd 存储，BuildKit 默认附加 provenance/SBOM | `--provenance=false --sbom=false` |
+| `~/.ssh/xxx` 变成 `/.ssh/xxx` | `.env` 里的 `~` 丢失或带引号未展开 | 用绝对路径；脚本也已补上展开逻辑 |
+| `docker` 命令指向 `\\wsl.localhost\...` 之外的 Windows 版 | WSL 的 `appendWindowsPath` 把 Windows PATH 追加进来 | 配 `/etc/wsl.conf` 的 `[interop] appendWindowsPath = false` |
+| WSL 里 `go` 只在交互式终端可用 | PATH 写在 `~/.bashrc`，非交互 shell 会提前 return | 软链到 `/usr/local/bin`，或写 `/etc/profile.d/` |
+| 两份代码副本漂移 | Windows 与 WSL 各一份 | 以 WSL 那份为准，用 git 统一；改完及时同步 |
 
-| 配置项 | `deploy/.env.example` | GitHub Secrets | 服务器 `deploy/.env` |
+### 如何验证部署真的生效
+
+不要只看"页面能打开"。用**可区分的标记**验证端到端：
+
+1. 改一行**会体现在接口响应里**的代码（例如 `handlers.go` 里 health 的 `dbStatus` 初值）
+2. `bash scripts/deploy.sh v0.1.1`
+3. `curl http://<服务器IP>:8080/api/health`，确认返回了新标记
+
+进一步确认"镜像里真的是新代码"，可以把二进制从镜像里取出来比对：
+
+```bash
+docker create --name tmpimg <镜像地址>
+docker cp tmpimg:/app/xiangqi /tmp/xiangqi-bin
+docker rm tmpimg
+
+# 与旧版本比 md5，或直接搜特征字节
+md5sum /tmp/xiangqi-bin
+grep -c -a "你的标记" /tmp/xiangqi-bin
+```
+
+这比任何静态检查都能说明问题。
+
+---
+
+## 附 B：接入 Gitee Go（可选）
+
+目标是让 `git push` 自动触发构建部署，省掉手工执行 `deploy.sh`。
+
+### Gitee Go 的能力边界（核对官方文档得到）
+
+| 插件 | 官方支持 | 本项目能用吗 |
+|---|---|---|
+| `build@golang` | Go **≤ 1.16** | ❌ 项目要求 1.24 |
+| `build@nodejs` | Node **≤ 15** | ❌ Vite 5 需要 18+ |
+| `ut@maven` / `ut@gradle` | 仅 Java | ❌ 语言不匹配 |
+| **`build@docker`** | 构建镜像并推送远程仓库 | ✅ **可用** |
+| `shell@agent` | 在主机组执行脚本 | ✅ 可用（部署） |
+| `deploy@agent` | 下载制品到主机组并执行脚本 | ✅ 可用 |
+
+**结论**：Gitee Go 的官方编译插件版本偏旧（文档停留在 2021-2022 年，明显偏 Java 生态），**不能用来编译本项目**。但它能用 `build@docker` 构建镜像、用 `shell@agent` 执行部署脚本——而本项目的 `deploy/Dockerfile` 已经是三段构建，Go/Node 版本都定死在镜像里，不依赖宿主环境，正好适配。
+
+### 配置要点
+
+- 配置文件位置：仓库根目录的 **`.workflow/`** 文件夹
+- **开通前提**：Gitee 账号需**绑定手机号**
+- **免费额度**：单仓库 200 分钟永久 + 每月 500 分钟
+- 额度省着用的话，让**构建部署只在打 tag 时触发**，日常 push 不跑
+
+### 建议的推进顺序
+
+**先用 `deploy.sh` 把链路跑通并验证过，再接 Gitee Go**。理由是自动化平台会掩盖问题：一旦失败，你分不清是脚本错了还是平台配置错了。而 `deploy.sh` 是"可被任何平台调用"的一层——Gitee Go、GitHub Actions 都只是换个触发者。
+
+---
+
+## 附 C：配置对照总表
+
+| 配置项 | 模板文件（入库） | 本地真实值 | 服务器真实值 |
 |---|---|---|---|
-| MySQL root 密码 | `MYSQL_ROOT_PASSWORD` | `MYSQL_ROOT_PASSWORD` | 由 CI 生成 |
-| 应用数据库密码 | `MYSQL_PASSWORD` | `MYSQL_PASSWORD` | 由 CI 生成 |
-| JWT 密钥 | `XIANGQI_JWT_SECRET` | `XIANGQI_JWT_SECRET` | 由 CI 生成 |
-| 允许来源 | `XIANGQI_ALLOWED_ORIGINS` | Variables 同名 | 由 CI 生成 |
-| 镜像地址 | `XIANGQI_IMAGE` | 由 build job 产出 | 由 CI 生成 |
-| ACR 凭证 | 不出现 | `ACR_*` 四个 | 不写进 .env |
+| MySQL root 密码 | `deploy/.env.example` | `deploy/.env` | 由部署脚本生成 |
+| 应用数据库密码 | 同上 | 同上 | 由部署脚本生成 |
+| JWT 密钥 | 同上 | 同上 | 由部署脚本生成 |
+| 镜像地址 | 同上（`XIANGQI_IMAGE`） | 本地用构建出的镜像 | 部署脚本强制覆盖为本次 tag |
+| ACR 凭据 | `deploy/.env.deploy.example` | `deploy/.env.deploy` | 不落盘（临时 `docker login`） |
+| 服务器清单 | `deploy/servers.example.json` | `deploy/servers.json` | 不需要 |
+| 部署 SSH 密钥 | 无 | `~/.ssh/xiangqi_deploy` | 公钥在 `authorized_keys` |
 
-规律：**Secrets 是唯一事实来源，服务器 `.env` 是它的产物，`.env.example` 只是模板。**
+**规律**：模板入库、真实值本地留一份、服务器上的由脚本生成。改密码只改本地一处，重新部署即生效。
 
 ---
 
 ## 进度
 
-- [x] 阶段 5 步骤就绪（待执行：git init、Gitee 建仓、首次推送）
-- [x] 阶段 6 步骤就绪（待执行：GitHub PAT、Gitee 镜像配置）
-- [x] 阶段 7 CI 已落地：`.github/workflows/ci.yml`
-- [x] 阶段 8 CD 已落地：`.github/workflows/release.yml` + `deploy/servers.example.json`
-- [x] 阶段 3：配置外部化（已并入阶段 2）
-- [x] 阶段 4：IDE 实时调试方案 —— 见 [ide-debug-guide.md](ide-debug-guide.md)
+- [x] 阶段 5：Git 仓库 + Gitee 托管
+- [x] 阶段 6：镜像构建与推送（`scripts/deploy.sh`）
+- [x] 阶段 7：多服务器部署（已在一台阿里云 ECS 上验证）
+- [ ] 阶段 8：回滚与密钥轮换（文档就绪，未实际演练）
+- [ ] 可选：接入 Gitee Go 实现 push 自动部署

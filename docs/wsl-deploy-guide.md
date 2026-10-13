@@ -492,6 +492,9 @@ GoLand 的 Database 工具连 `127.0.0.1:3306`（用户 `xiangqi`）即可查库
 | 加速器返回 **403 Forbidden** | 阿里云已限制**非阿里云主机**调用其镜像加速器 | 换公共源（见下方实测）；阿里云 ECS 上不受此限 |
 | manifest 拉得到、**层下载**失败 | 该加速器的对象存储对你不通 | 换源。实测 `docker.m.daocloud.io` 有此问题 |
 | push 报 `unknown manifest class for application/vnd.oci.empty.v1+json` | Docker 29 启用 containerd 镜像存储后，BuildKit 默认附带 provenance/SBOM 证明，产出的 manifest 含该 OCI 媒体类型；阿里云 ACR 不认识 | `docker build` 加 `--provenance=false --sbom=false`（`scripts/deploy.sh` 已内置，实测通过） |
+| 服务器上拉 `mysql:8.4` 超时 | 服务器没配镜像加速器 | **本地与服务器要用不同的加速器**：同一个阿里云地址在本地 WSL 返回 403、在阿里云 ECS 上返回 200（实测）。两边分别配置 |
+| WSL 里 `go`/`node` 只在交互式终端可用 | PATH 写在 `~/.bashrc`，而它开头有"非交互式就 return"的保护，IDE 用非交互方式调用时读不到 | 软链到 `/usr/local/bin`（`sudo ln -sf /usr/local/go/bin/go /usr/local/bin/go`），或写进 `/etc/profile.d/` |
+| 在 WSL 里敲 `docker`/`node` 调到了 Windows 版 | `appendWindowsPath` 把整个 Windows PATH 追加进了 Linux PATH | `/etc/wsl.conf` 加 `[interop] appendWindowsPath = false`，`wsl --shutdown` 后生效 |
 | `docker: command not found` | 装到了 Windows 的 Docker Desktop | WSL 内用 `/usr/bin/docker`，检查 PATH 是否混入 `/mnt/c/...` |
 | `systemctl` 不可用 | WSL 未启用 systemd | 配 `/etc/wsl.conf` 的 `[boot] systemd=true` 后 `wsl --shutdown` |
 | server 报 `Access denied ... CREATE DATABASE` | 普通账号无建库权限 | compose 里加 `command: ["-no-create-db"]` |
