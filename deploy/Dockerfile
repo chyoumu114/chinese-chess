@@ -5,7 +5,7 @@
 # 必须在仓库根执行构建，因为上下文要同时包含 web/ 与 server/。
 
 # ---- 第 1 段：构建 Vue 前端 ----
-FROM node:20-alpine AS web
+FROM node:22.23.4-alpine AS web
 WORKDIR /app/web
 
 # npm 源：容器内默认访问 registry.npmjs.org，境内极慢甚至超时。
@@ -23,14 +23,20 @@ COPY web/ ./
 RUN npm run build
 
 # ---- 第 2 段：编译 Go 服务端 ----
-FROM golang:1.24-alpine AS server
+FROM golang:1.27.3-alpine AS server
 WORKDIR /app/server
 
 # 模块代理：默认的 proxy.golang.org 在境内不可达，构建会直接失败。
-# 校验和数据库 sum.golang.org 同样依赖境外网络，所以默认关闭 GOSUMDB。
+#
+# GOSUMDB 必须保留默认值，**不能设成 off**：golang:1.27.3-alpine 镜像自带
+# GOTOOLCHAIN=go1.27.3，而镜像里的编译器其实只有 1.26.10，首次构建需要下载
+# 1.27.3 工具链；关闭校验会让这个下载被直接拒绝：
+#   go: golang.org/toolchain@v0.0.1-go1.27.3.linux-amd64: verifying module:
+#   checksum database disabled by GOSUMDB=off
+# 校验请求会经由上面的 GOPROXY（goproxy.cn 提供 sumdb 代理），境内可达。
 ARG GOPROXY_URL=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY_URL} \
-    GOSUMDB=off
+    GOSUMDB=sum.golang.org
 
 # 模块下载单独一层：源码变动时可以复用这一层，不必重新下载。
 COPY server/go.mod server/go.sum ./
