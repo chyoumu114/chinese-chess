@@ -28,6 +28,10 @@ services:
     # 移除继承来的 build 段：生产只拉取 CI 构建好的镜像，不在服务器上编译。
     build: !reset null
     image: "${XIANGQI_IMAGE:?生产环境必须在 .env 中指定 ACR 镜像地址}"
+    # 对外统一走宿主机 nginx（80/443 → 这里）：8080 只绑回环，
+    # 公网直接访问不到，也免得有人绕过 HTTPS 明文连。
+    ports: !override
+      - "127.0.0.1:8080:8080"
     environment:
       # 触发生产校验：serve 会拒绝默认的 JWT 占位密钥。
       XIANGQI_ENV: production

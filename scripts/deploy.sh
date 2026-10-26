@@ -158,6 +158,14 @@ deploy_one() {
     "$DEPLOY_DIR/docker-compose.prod.yml" \
     "$user@$host:$app_dir/deploy/"
 
+  # nginx 站点配置也纳入仓库：反代与证书的配置不再只能手工维护在服务器上。
+  # 分发后由下面的远端脚本建软链并 reload，机器上没有 nginx 时自然跳过。
+  if [ -f "$DEPLOY_DIR/nginx/xiangqi.example.com" ]; then
+    scp -i "$SSH_KEY" -P "$port" -o StrictHostKeyChecking=accept-new \
+      "$DEPLOY_DIR/nginx/xiangqi.example.com" \
+      "$user@$host:/etc/nginx/sites-available/xiangqi.example.com"
+  fi
+
   # 生成服务器端 .env：沿用源文件的变量，但镜像与运行环境由本次部署决定
   local tmp_env
   tmp_env="$(mktemp)"
@@ -185,6 +193,12 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
 docker image prune -f >/dev/null
 docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+
+# 站点反代配置随之生效（含 HTTPS）。没有 nginx 的机器跳过。
+if [ -f /etc/nginx/sites-available/xiangqi.example.com ]; then
+  ln -sfn /etc/nginx/sites-available/xiangqi.example.com /etc/nginx/sites-enabled/xiangqi.example.com
+  nginx -t && systemctl reload nginx && echo "nginx reloaded"
+fi
 REMOTE
 
   ssh $ssh_opts "$user@$host" \

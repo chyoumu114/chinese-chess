@@ -152,6 +152,18 @@ export class WsClient {
     this.#setStatus('idle')
   }
 
+  /**
+   * reconnect 丢掉当前连接，按最新的 token 重新握手。
+   *
+   * WebSocket 的身份在握手那一刻就定死了（服务端从 ?token= 解析出 identity），
+   * 连接期间换不了。所以登录/登出之后必须重来一次，否则服务端仍按旧身份对待：
+   * 未登录时进大厅、再登录后点「人机对战」会回 login_required，非得刷新页面才好。
+   */
+  reconnect() {
+    this.close()
+    this.connect()
+  }
+
   /** send writes one envelope. Returns false when the socket is not open. */
   send(type, data) {
     const socket = this.socket

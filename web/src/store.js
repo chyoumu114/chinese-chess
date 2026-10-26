@@ -73,6 +73,9 @@ export function applySession(payload) {
   setToken(state.token)
   state.user = payload.user || null
   state.stats = payload.stats || null
+  // 连接的身份在握手时定死，登录后必须按新 token 重建；否则大厅里能看到自己，
+  // 但入座时服务端还认为这是游客。
+  ws.reconnect()
 }
 
 /** loadMe refreshes the signed-in profile, clearing a stale token. */
@@ -100,7 +103,8 @@ export function signOut(announce = true) {
   state.room = null
   state.chat = []
   state.pending = { draw: '', takeback: '' }
-  ws.close()
+  // 不是简单 close：以游客身份重新连上，大厅的在线名单与房间列表还要继续刷新。
+  ws.reconnect()
   if (announce) toast('已退出登录', 'info')
 }
 

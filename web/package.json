@@ -7,7 +7,7 @@
     "dev": "node scripts/vite.mjs dev",
     "build": "node scripts/vite.mjs build",
     "preview": "node scripts/vite.mjs preview",
-    "test": "node scripts/defines.test.mjs && node scripts/board.test.mjs"
+    "test": "node scripts/defines.test.mjs && node scripts/board.test.mjs && node scripts/ws.test.mjs"
   },
   "dependencies": {
     "vue": "^3.5.13",
