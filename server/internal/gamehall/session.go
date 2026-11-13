@@ -1477,6 +1477,33 @@ func (s *Session) ReapFinished(maxAge time.Duration) int {
 	return removed
 }
 
+// ReapWaiting drops rooms that have been waiting for an opponent since before
+// the cutoff. Without it the lobby can be filled with abandoned tables: someone
+// opens a room, closes the tab, and nothing ever collects it.
+//
+// Two hours is deliberately generous: a real player waiting that long is already
+// unusual, and they can simply open a new room.
+func (s *Session) ReapWaiting(maxAge time.Duration) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := s.cfg.Now().Add(-maxAge)
+	removed := 0
+	for id, r := range s.rooms {
+		if r.Status == StatusPlaying || r.Status == StatusFinished {
+			continue
+		}
+		if !r.CreatedAt.Before(cutoff) {
+			continue
+		}
+		delete(s.rooms, id)
+		s.byUserDelete(r)
+		s.removeFromWaitingLocked(id)
+		removed++
+	}
+	return removed
+}
+
 func maxInt64(a, b int64) int64 {
 	if a > b {
 		return a

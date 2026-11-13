@@ -20,8 +20,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	status := "ok"
 	dbStatus := "ok"
 	if err := s.store.Ping(r.Context()); err != nil {
+		// The detail (driver text, internal address) goes to the log, not to the
+		// caller: /api/health is unauthenticated and reachable from the internet.
+		s.logger.Error("health: database unreachable", "error", err)
 		status = "degraded"
-		dbStatus = err.Error()
+		dbStatus = "unavailable"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":   status,
@@ -124,7 +127,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "bad_credentials", "用户名或密码不正确")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "login_failed", err.Error())
+		s.logger.Error("login: store failure", "error", err)
+		writeError(w, http.StatusInternalServerError, "login_failed", "登录失败，请稍后重试")
 		return
 	}
 	token, exp, err := s.tokens.Issue(user.ID, user.Username)
@@ -152,7 +156,8 @@ func (s *Server) handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 50)
 	users, err := s.store.Leaderboard(r.Context(), limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "query_failed", err.Error())
+		s.logger.Error("store query failed", "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusInternalServerError, "query_failed", "服务暂时不可用，请稍后重试")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": users})
@@ -171,7 +176,8 @@ func (s *Server) handleUserProfile(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "用户不存在")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "query_failed", err.Error())
+		s.logger.Error("store query failed", "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusInternalServerError, "query_failed", "服务暂时不可用，请稍后重试")
 		return
 	}
 	stats, err := s.store.StatsForUser(r.Context(), id)
@@ -261,7 +267,8 @@ func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
 
 	games, err := s.store.ListGames(r.Context(), filter)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "query_failed", err.Error())
+		s.logger.Error("store query failed", "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusInternalServerError, "query_failed", "服务暂时不可用，请稍后重试")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"games": games})
@@ -279,7 +286,8 @@ func (s *Server) handleGetGame(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "对局不存在")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "query_failed", err.Error())
+		s.logger.Error("store query failed", "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusInternalServerError, "query_failed", "服务暂时不可用，请稍后重试")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"game": g})
@@ -297,12 +305,14 @@ func (s *Server) handleGetGameMoves(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "对局不存在")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "query_failed", err.Error())
+		s.logger.Error("store query failed", "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusInternalServerError, "query_failed", "服务暂时不可用，请稍后重试")
 		return
 	}
 	moves, err := s.store.Moves(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "query_failed", err.Error())
+		s.logger.Error("store query failed", "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusInternalServerError, "query_failed", "服务暂时不可用，请稍后重试")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"game": g, "moves": moves})

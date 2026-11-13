@@ -160,6 +160,12 @@ deploy_one() {
 
   # nginx 站点配置也纳入仓库：反代与证书的配置不再只能手工维护在服务器上。
   # 分发后由下面的远端脚本建软链并 reload，机器上没有 nginx 时自然跳过。
+  # 日志 format 先落地：站点配置引用它，顺序反了 nginx -t 会失败。
+  if [ -f "$DEPLOY_DIR/nginx/00-chess-log.conf" ]; then
+    scp -i "$SSH_KEY" -P "$port" -o StrictHostKeyChecking=accept-new \
+      "$DEPLOY_DIR/nginx/00-chess-log.conf" \
+      "$user@$host:/etc/nginx/conf.d/00-chess-log.conf"
+  fi
   if [ -f "$DEPLOY_DIR/nginx/xiangqi.example.com" ]; then
     scp -i "$SSH_KEY" -P "$port" -o StrictHostKeyChecking=accept-new \
       "$DEPLOY_DIR/nginx/xiangqi.example.com" \

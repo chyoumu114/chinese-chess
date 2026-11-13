@@ -76,7 +76,8 @@ func New(cfg config.Config, st DataStore, session *gamehall.Session, hub *ws.Hub
 
 // Handler returns the composed handler, including static files and middleware.
 func (s *Server) Handler() http.Handler {
-	return s.withRecovery(s.withSecurityHeaders(s.withRateLimit(s.withLogging(s.withCORS(s.mux)))))
+	return s.withRecovery(s.withSecurityHeaders(s.withConcurrencyLimit(
+		s.withRateLimit(s.withLogging(s.withCORS(s.mux))))))
 }
 
 // routes registers every endpoint. Go's pattern syntax (method and wildcards)

@@ -19,6 +19,9 @@ const (
 	aiSlots = 4
 	// maxAIBudget caps the search time an HTTP caller may request.
 	maxAIBudget = 800 * time.Millisecond
+	// maxConcurrentRequests bounds how many API requests are processed at once,
+	// so a pile-up of slow requests cannot consume the whole process.
+	maxConcurrentRequests = 256
 )
 
 // limiters groups the per-route buckets. Rates are requests per minute.
@@ -73,6 +76,27 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// withConcurrencyLimit caps in-flight API requests. WebSocket handshakes are
+// excluded: they occupy their slot for the connection's lifetime, and capping
+// them here would make the table fill up with spectators.
+func (s *Server) withConcurrencyLimit(next http.Handler) http.Handler {
+	sem := make(chan struct{}, maxConcurrentRequests)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusServiceUnavailable, "busy", "服务器繁忙，请稍后再试")
+		}
 	})
 }
 

@@ -102,9 +102,14 @@ func run() error {
 		Addr:              cfg.Addr,
 		Handler:           apiServer.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// ReadTimeout bounds the whole request read, which stops a client from
+		// holding a connection open by trickling a body. It does not affect the
+		// WebSocket: hijacked connections are managed by the hub afterwards.
+		ReadTimeout: 30 * time.Second,
 		// No WriteTimeout: a WebSocket connection is long lived, and a write
 		// deadline would cut it off. Per-write deadlines are set inside the hub.
-		IdleTimeout: 120 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	// Background jobs: clock expiry, presence and room reaping.

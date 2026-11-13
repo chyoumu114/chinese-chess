@@ -546,6 +546,9 @@ func (h *Hub) StartTimers(ctx context.Context) {
 		case <-presence.C:
 			h.sendPresence()
 		case <-reap.C:
+			if n := h.session.ReapWaiting(2 * time.Hour); n > 0 {
+				h.logger.Info("reaped abandoned waiting rooms", "count", n)
+			}
 			h.session.ReapFinished(2 * time.Hour)
 		}
 	}
