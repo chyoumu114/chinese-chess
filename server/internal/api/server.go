@@ -46,6 +46,11 @@ type Server struct {
 	tokens  *auth.TokenIssuer
 	logger  *slog.Logger
 
+	// limits holds the per-route token buckets; aiSem caps concurrent engine
+	// searches so a burst of requests cannot pin every core.
+	limits *limiters
+	aiSem  chan struct{}
+
 	mux *http.ServeMux
 }
 
@@ -61,6 +66,8 @@ func New(cfg config.Config, st DataStore, session *gamehall.Session, hub *ws.Hub
 		hub:     hub,
 		tokens:  tokens,
 		logger:  logger,
+		limits:  newLimiters(cfg),
+		aiSem:   make(chan struct{}, aiSlots),
 		mux:     http.NewServeMux(),
 	}
 	s.routes()
@@ -69,7 +76,7 @@ func New(cfg config.Config, st DataStore, session *gamehall.Session, hub *ws.Hub
 
 // Handler returns the composed handler, including static files and middleware.
 func (s *Server) Handler() http.Handler {
-	return s.withRecovery(s.withLogging(s.withCORS(s.mux)))
+	return s.withRecovery(s.withSecurityHeaders(s.withRateLimit(s.withLogging(s.withCORS(s.mux)))))
 }
 
 // routes registers every endpoint. Go's pattern syntax (method and wildcards)
@@ -77,8 +84,10 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
 
-	s.mux.HandleFunc("POST /api/auth/register", s.handleRegister)
-	s.mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	// Credential endpoints get their own tight bucket: they are the
+	// brute-force surface, and each attempt costs a password hash.
+	s.mux.HandleFunc("POST /api/auth/register", s.rateLimited("register", s.limits.auth, s.handleRegister))
+	s.mux.HandleFunc("POST /api/auth/login", s.rateLimited("login", s.limits.auth, s.handleLogin))
 	s.mux.HandleFunc("GET /api/auth/me", s.auth(s.handleMe))
 
 	s.mux.HandleFunc("GET /api/leaderboard", s.handleLeaderboard)
@@ -90,7 +99,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/games/{id}/moves", s.handleGetGameMoves)
 
 	s.mux.HandleFunc("GET /api/rules", s.handleRules)
-	s.mux.HandleFunc("GET /api/ai/move", s.handleAIMove)
+	// The engine search is the only endpoint whose cost is decided by the
+	// caller, so it also gets its own bucket on top of the global one.
+	s.mux.HandleFunc("GET /api/ai/move", s.rateLimited("ai", s.limits.ai, s.handleAIMove))
 
 	s.mux.HandleFunc("GET /ws", s.handleWebSocket)
 
@@ -241,15 +252,16 @@ func (s *Server) withRecovery(next http.Handler) http.Handler {
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
-	allowed := s.cfg.AllowedOrigins
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" && (len(allowed) == 0 || containsFold(allowed, origin)) {
+		if origin != "" && s.originAllowed(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			// No Allow-Credentials: the session travels in the Authorization
+			// header, and that flag only widens the attack surface.
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Max-Age", "600")
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

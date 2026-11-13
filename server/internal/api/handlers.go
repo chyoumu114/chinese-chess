@@ -324,9 +324,24 @@ func (s *Server) handleAIMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	level := ai.ParseLevel(queryInt(r, "level", int(ai.LevelNormal)))
+	// The caller may ask for less work, never more: an unbounded budget turns a
+	// cheap GET into a CPU sink.
 	budget := time.Duration(queryInt(r, "budgetMs", int(s.cfg.TurnTimeout.Milliseconds()))) * time.Millisecond
-	if budget <= 0 || budget > 5*time.Second {
+	if budget <= 0 || budget > maxAIBudget {
 		budget = s.session.Config().AIBudget
+	}
+	if budget > maxAIBudget {
+		budget = maxAIBudget
+	}
+
+	// One search per slot: without this a burst of requests pins every core and
+	// also stalls the games already in progress.
+	select {
+	case s.aiSem <- struct{}{}:
+		defer func() { <-s.aiSem }()
+	default:
+		writeError(w, http.StatusServiceUnavailable, "engine_busy", "引擎繁忙，请稍后再试")
+		return
 	}
 
 	move, ok := ai.Search(g, level, budget)

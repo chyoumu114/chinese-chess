@@ -27,6 +27,11 @@ var (
 	ErrTokenAlg       = errors.New("auth: unsupported token algorithm")
 )
 
+// maxTokenTTL bounds how long a token may claim to live. Anything longer is
+// rejected as malformed rather than honoured: there is no revocation list, so a
+// long-lived token is a long-lived liability.
+const maxTokenTTL = 30 * 24 * time.Hour
+
 // Claims is the payload carried by a session token.
 type Claims struct {
 	Subject   int64  `json:"sub"`
@@ -121,8 +126,16 @@ func (t *TokenIssuer) Parse(token string) (Claims, error) {
 		return Claims{}, ErrTokenMalformed
 	}
 	now := time.Now().Unix()
-	if claims.Expires != 0 && now > claims.Expires {
+	// exp and iat are mandatory: without exp a token would never expire, and
+	// without iat an over-long lifetime cannot be detected.
+	if claims.Expires == 0 || claims.IssuedAt == 0 {
+		return Claims{}, ErrTokenMalformed
+	}
+	if now > claims.Expires {
 		return Claims{}, ErrTokenExpired
+	}
+	if claims.Expires-claims.IssuedAt > int64(maxTokenTTL.Seconds()) {
+		return Claims{}, ErrTokenMalformed
 	}
 	if claims.NotBefore != 0 && now < claims.NotBefore {
 		return Claims{}, ErrTokenNotYet

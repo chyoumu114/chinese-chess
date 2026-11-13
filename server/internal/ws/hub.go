@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,13 @@ type Hub struct {
 	logger  *slog.Logger
 	origins []string
 
+	// pending records when a signed-in player's last connection went away, so the
+	// periodic sweep can forfeit a running game if they never come back.
+	pending map[int64]time.Time
+	// grace is how long a player may stay offline mid-game before losing. It is
+	// a field rather than a constant so tests can shorten it.
+	grace time.Duration
+
 	mu      sync.RWMutex
 	clients map[*Client]struct{}
 	// byRoom indexes the clients attached to each room so broadcasts are cheap.
@@ -76,6 +84,8 @@ func NewHub(session *gamehall.Session, logger *slog.Logger, allowedOrigins []str
 		session: session,
 		logger:  logger,
 		origins: allowedOrigins,
+		pending: make(map[int64]time.Time),
+		grace:   defaultDisconnectGrace,
 		clients: make(map[*Client]struct{}),
 		byRoom:  make(map[int64]map[*Client]struct{}),
 		updates: make(chan int64, 1024),
@@ -140,21 +150,58 @@ func (h *Hub) runBroadcasts(ctx context.Context) {
 	}
 }
 
-// checkOrigin enforces the configured origin allowlist. An empty allowlist
-// accepts any origin, which is correct for a same-origin deployment behind a
-// reverse proxy and for local development.
+// checkOrigin enforces the WebSocket origin policy.
+//
+// An empty allowlist no longer means "anyone": it falls back to same-origin,
+// which is what a deployment behind our own reverse proxy needs. Development
+// additionally accepts a localhost dev server, because `npm run dev` serves the
+// SPA from another port. Accepting arbitrary origins would let a hostile page
+// open a socket carrying the victim's session.
 func (h *Hub) checkOrigin(r *http.Request) bool {
-	if len(h.origins) == 0 {
-		return true
-	}
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		return true // non-browser client
+		// Non-browser clients (the end-to-end suite, tools) send no Origin.
+		return true
 	}
 	for _, allowed := range h.origins {
 		if strings.EqualFold(strings.TrimSuffix(allowed, "/"), strings.TrimSuffix(origin, "/")) {
 			return true
 		}
+	}
+	if len(h.origins) > 0 {
+		return false
+	}
+	return sameOrigin(origin, r) || isLocalDevOrigin(origin)
+}
+
+// sameOrigin reports whether origin matches this request's own scheme and host.
+func sameOrigin(origin string, r *http.Request) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); proto != "" {
+		scheme = strings.ToLower(proto)
+	}
+	return strings.EqualFold(u.Scheme, scheme) && strings.EqualFold(u.Host, r.Host)
+}
+
+// isLocalDevOrigin reports whether origin is a localhost dev server.
+//
+// Duplicated in the api package on purpose: ws must not import api, and a shared
+// helper for ten lines would be a worse dependency than the copy.
+func isLocalDevOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
 	}
 	return false
 }
@@ -198,6 +245,11 @@ func (h *Hub) remove(c *Client) {
 	for roomID := range c.rooms {
 		h.detachRoomLocked(c, roomID)
 	}
+	// Start the abandonment clock when a signed-in player goes fully offline.
+	// Closing the tab mid-game must not be a free escape from a loss.
+	if userID := c.identity.UserID; userID != 0 && !h.onlineLocked(userID) {
+		h.pending[userID] = time.Now()
+	}
 	h.mu.Unlock()
 }
 
@@ -207,6 +259,12 @@ func (h *Hub) remove(c *Client) {
 func (h *Hub) hasClientFor(userID int64) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	return h.onlineLocked(userID)
+}
+
+// onlineLocked reports whether the account still has a live connection. Caller
+// holds the hub lock.
+func (h *Hub) onlineLocked(userID int64) bool {
 	for other := range h.clients {
 		if other.identity.UserID == userID {
 			return true
@@ -414,6 +472,55 @@ func (h *Hub) Close() {
 	}
 }
 
+// defaultDisconnectGrace is how long a seated player may stay offline before
+// the game is forfeited in the opponent's favour.
+const defaultDisconnectGrace = 60 * time.Second
+
+// forfeitAbandoned finishes games whose seated player stayed offline past the
+// grace period.
+//
+// Without this the room would sit in playing forever when the game clock is
+// disabled, which it is by default. Reconnecting inside the grace period simply
+// drops the entry, so a flaky network does not cost a game.
+func (h *Hub) forfeitAbandoned(ctx context.Context) {
+	now := time.Now()
+
+	h.mu.Lock()
+	due := make([]int64, 0, 4)
+	for userID, since := range h.pending {
+		if h.onlineLocked(userID) {
+			delete(h.pending, userID)
+			continue
+		}
+		if now.Sub(since) >= h.grace {
+			due = append(due, userID)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, userID := range due {
+		// The sweep runs outside the hub lock: it calls into the session, and
+		// the lock order is hub -> session everywhere else too.
+		h.mu.Lock()
+		delete(h.pending, userID)
+		h.mu.Unlock()
+
+		roomID, seated := h.session.RoomIDForUser(userID)
+		if !seated {
+			continue
+		}
+		// Leaving a running room abandons the game and records the loss, which is
+		// exactly the outcome an abandoned game should have.
+		out := h.session.Leave(ctx, roomID, userID)
+		if out.Result != nil {
+			h.announceResult(roomID, out.Result)
+		}
+		if !out.Dissolved {
+			h.broadcastRoom(roomID)
+		}
+	}
+}
+
 // StartTimers runs the periodic jobs: clock expiry, presence refresh and room
 // reaping. It also drives the broadcast worker. It returns when ctx is
 // cancelled.
@@ -435,6 +542,7 @@ func (h *Hub) StartTimers(ctx context.Context) {
 			for _, expired := range h.session.ExpireTimeouts(ctx) {
 				h.announceResult(expired.RoomID, expired.Result)
 			}
+			h.forfeitAbandoned(ctx)
 		case <-presence.C:
 			h.sendPresence()
 		case <-reap.C:

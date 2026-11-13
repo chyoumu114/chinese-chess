@@ -26,6 +26,10 @@ type Config struct {
 	// TokenTTL is how long an issued session token stays valid.
 	TokenTTL time.Duration
 
+	// RateLimitDisabled turns the HTTP token buckets off. Only tests and load
+	// tools should set XIANGQI_RATE_LIMIT=off.
+	RateLimitDisabled bool
+
 	// AllowedOrigins lists the browser origins allowed to open a WebSocket.
 	// An empty list allows any origin, which suits a same-origin deployment.
 	AllowedOrigins []string
@@ -111,13 +115,47 @@ func Load() (Config, error) {
 		}
 	}
 
-	if c.IsProduction() && c.JWTSecret == "dev-insecure-secret-change-me" {
-		return c, fmt.Errorf("config: XIANGQI_JWT_SECRET must be set in production")
+	if c.IsProduction() {
+		if err := validateJWTSecret(c.JWTSecret); err != nil {
+			return c, err
+		}
+	}
+	// The end-to-end suite and load tests drive everything from one address, so
+	// they turn the buckets off explicitly. Production leaves this at the
+	// default (on): real callers arrive from many addresses.
+	if strings.EqualFold(env("XIANGQI_RATE_LIMIT", "on"), "off") {
+		c.RateLimitDisabled = true
 	}
 	if c.DB.Name == "" {
 		return c, fmt.Errorf("config: XIANGQI_DB_NAME must not be empty")
 	}
 	return c, nil
+}
+
+// validateJWTSecret rejects production signing secrets that are placeholders or
+// too weak to slow an offline brute-force down.
+//
+// A plain equality check against the shipped placeholder is not enough: copying
+// .env.example and only changing the passwords would leave a known secret in
+// place, and short/low-entropy values fall to a dictionary attack instantly.
+func validateJWTSecret(secret string) error {
+	if len(secret) < 32 {
+		return fmt.Errorf("config: XIANGQI_JWT_SECRET must be at least 32 bytes, got %d", len(secret))
+	}
+	lower := strings.ToLower(secret)
+	for _, placeholder := range []string{"dev-insecure", "change-me", "changeme", "secret", "password", "example"} {
+		if strings.Contains(lower, placeholder) {
+			return fmt.Errorf("config: XIANGQI_JWT_SECRET must not contain the placeholder %q", placeholder)
+		}
+	}
+	distinct := make(map[rune]struct{}, len(secret))
+	for _, r := range secret {
+		distinct[r] = struct{}{}
+	}
+	if len(distinct) < 10 {
+		return fmt.Errorf("config: XIANGQI_JWT_SECRET has insufficient entropy (%d distinct characters)", len(distinct))
+	}
+	return nil
 }
 
 func env(key, fallback string) string {

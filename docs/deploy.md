@@ -338,3 +338,21 @@ cd web && npm install && npm run dev     # http://localhost:5173
 ```
 
 本地内存模式（`-store memory`）不落库，重启即清空；要复用账号就接上 §2.1 的 MySQL。
+
+---
+
+## 12. 限流与安全响应头
+
+应用自身已带以下防护，无需在 nginx 重复实现（但可以叠加）：
+
+| 项 | 行为 |
+|---|---|
+| 登录/注册 | 每 IP 20 次/分钟、突发 10，超出返回 429 |
+| AI 试探接口 | 每 IP 20 次/分钟、突发 4；全局 4 个并发槽位，满则 503 `engine_busy` |
+| 其余 API / WS | 每 IP 180 次/分钟、突发 60 |
+| 安全响应头 | CSP、X-Frame-Options、X-Content-Type-Options、Referrer-Policy、Permissions-Policy；HTTPS 下追加 HSTS |
+| WebSocket Origin | 配置了 `XIANGQI_ALLOWED_ORIGINS` 时按名单；留空则只允许同源（开发环境额外允许 localhost） |
+| 断线判负 | 对局中掉线超过 60 秒判负，宽限期内重连不受影响 |
+
+**`XIANGQI_RATE_LIMIT=off`** 会关闭全部令牌桶，只应在 e2e 与压测时使用：
+那些场景从同一个 IP 发起全部请求，正常限流会把它们误判成攻击。
