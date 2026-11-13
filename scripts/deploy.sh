@@ -144,6 +144,14 @@ SRC_ENV="$ENV_PROD"
 [ -f "$SRC_ENV" ] || die "找不到 $ENV_PROD 或 $ENV_DEV，无法生成服务器端 .env"
 warn "服务器端 .env 由 $SRC_ENV 生成（XIANGQI_IMAGE 与 XIANGQI_ENV 会被覆盖）"
 
+# 站点配置模板渲染：仓库里保存的是 __DOMAIN__ 占位符，真实域名只在本地的 .env。
+XIANGQI_DOMAIN="$(grep -E '^XIANGQI_DOMAIN=' "$SRC_ENV" | head -1 | cut -d= -f2- | tr -d '\"')"
+[ -n "$XIANGQI_DOMAIN" ] || die "在 $SRC_ENV 里设置 XIANGQI_DOMAIN（用于渲染 deploy/nginx/site.conf.template）"
+SITE_CONF="$(mktemp)"
+sed "s|__DOMAIN__|$XIANGQI_DOMAIN|g" "$DEPLOY_DIR/nginx/site.conf.template" > "$SITE_CONF"
+trap 'rm -f "$SITE_CONF"' EXIT
+ok "nginx 站点配置已按 XIANGQI_DOMAIN=$XIANGQI_DOMAIN 渲染"
+
 deploy_one() {
   local name="$1" host="$2" port="$3" user="$4" app_dir="$5"
   # shellcheck disable=SC2086
@@ -166,10 +174,11 @@ deploy_one() {
       "$DEPLOY_DIR/nginx/00-chess-log.conf" \
       "$user@$host:/etc/nginx/conf.d/00-chess-log.conf"
   fi
-  if [ -f "$DEPLOY_DIR/nginx/xiangqi.example.com" ]; then
+  # 站点配置来自模板，真实域名只在 .env 的 XIANGQI_DOMAIN 里。
+  if [ -n "${SITE_CONF:-}" ] && [ -f "$SITE_CONF" ]; then
     scp -i "$SSH_KEY" -P "$port" -o StrictHostKeyChecking=accept-new \
-      "$DEPLOY_DIR/nginx/xiangqi.example.com" \
-      "$user@$host:/etc/nginx/sites-available/xiangqi.example.com"
+      "$SITE_CONF" \
+      "$user@$host:/etc/nginx/sites-available/xiangqi.conf"
   fi
 
   # 生成服务器端 .env：沿用源文件的变量，但镜像与运行环境由本次部署决定
@@ -201,8 +210,10 @@ docker image prune -f >/dev/null
 docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
 
 # 站点反代配置随之生效（含 HTTPS）。没有 nginx 的机器跳过。
-if [ -f /etc/nginx/sites-available/xiangqi.example.com ]; then
-  ln -sfn /etc/nginx/sites-available/xiangqi.example.com /etc/nginx/sites-enabled/xiangqi.example.com
+# 从旧版本升级时，先手工删掉以域名命名的旧软链，否则 server_name 会冲突：
+#   rm -f /etc/nginx/sites-enabled/<旧域名>
+if [ -f /etc/nginx/sites-available/xiangqi.conf ]; then
+  ln -sfn /etc/nginx/sites-available/xiangqi.conf /etc/nginx/sites-enabled/xiangqi.conf
   nginx -t && systemctl reload nginx && echo "nginx reloaded"
 fi
 REMOTE

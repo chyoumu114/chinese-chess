@@ -113,7 +113,7 @@ git ls-remote --heads origin
 
 ### 6.1 准备 ACR
 
-阿里云「容器镜像服务 ACR」→ 创建**个人版**实例（免费）→ 建命名空间（如 `example-namespace`）→ 建镜像仓库。
+阿里云「容器镜像服务 ACR」→ 创建**个人版**实例（免费）→ 建命名空间（如 `<你的命名空间>`）→ 建镜像仓库。
 
 记下四项：
 
@@ -138,7 +138,7 @@ chmod 600 .env.deploy
 若服务器拉不动 Docker Hub（见 6.5），再加一行指向私有仓库的 MySQL 镜像：
 
 ```ini
-MYSQL_IMAGE=crpi-xxxxxxxx.cn-shenzhen.personal.cr.aliyuncs.com/example-namespace/mysql:8.4
+MYSQL_IMAGE=crpi-xxxxxxxx.cn-shenzhen.personal.cr.aliyuncs.com/<你的命名空间>/mysql:8.4
 ```
 
 ### 6.3 只构建推送（先验证这一步）
@@ -173,7 +173,7 @@ error from registry: unknown manifest class for application/vnd.oci.empty.v1+jso
 服务器的 `docker-compose.prod.yml` 需要 `mysql:8.4`。若服务器拉不动 Docker Hub，就把镜像先推到自己的 ACR：
 
 ```bash
-ACR=crpi-xxxxxxxx.cn-shenzhen.personal.cr.aliyuncs.com/example-namespace
+ACR=crpi-xxxxxxxx.cn-shenzhen.personal.cr.aliyuncs.com/<你的命名空间>
 
 docker tag mysql:8.4 $ACR/mysql:8.4
 docker push $ACR/mysql:8.4          # 1.12 GB，较慢，一次性

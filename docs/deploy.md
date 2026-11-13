@@ -73,7 +73,7 @@ sudo systemctl restart docker
 sudo apt install -y nginx certbot python3-certbot-nginx
 ```
 
-页面反代配置在仓库里（`deploy/nginx/xiangqi.example.com`），`scripts/deploy.sh` 每次部署都会同步过去并 `nginx -t && reload`，**不需要手工维护**。首次签发证书见 §5。
+页面反代配置在仓库里（`deploy/nginx/<你的域名>`），`scripts/deploy.sh` 每次部署都会同步过去并 `nginx -t && reload`，**不需要手工维护**。首次签发证书见 §5。
 
 ### 1.3 部署专用密钥
 
@@ -178,7 +178,7 @@ bash scripts/deploy.sh v0.1.0
 ├── docker-compose.yml          # 由 deploy.sh 分发
 ├── docker-compose.prod.yml     # 生产覆盖层：只拉镜像、8080 绑回环
 ├── .env                        # 自动生成，chmod 600
-└── /etc/nginx/sites-available/xiangqi.example.com   # 站点反代（deploy.sh 同步）
+└── /etc/nginx/sites-available/<你的域名>   # 站点反代（deploy.sh 同步）
 ```
 
 数据在 Docker 卷 `xiangqi_mysql-data`，`docker compose down`（不加 `-v`）不会丢。
@@ -187,14 +187,14 @@ bash scripts/deploy.sh v0.1.0
 
 ## 5. nginx 与 HTTPS
 
-`deploy/nginx/xiangqi.example.com` 里已经写好了：80/443 监听、`proxy_pass 127.0.0.1:8080`、
+`deploy/nginx/<你的域名>` 里已经写好了：80/443 监听、`proxy_pass 127.0.0.1:8080`、
 以及 **WebSocket 透传**（`Upgrade` / `Connection` 头 + 长 `proxy_read_timeout`）。
 这一层缺了 `Upgrade` 头，表现是「大厅能打开、进对局连不上」。
 
 首次签发证书（需要 80 端口可达）：
 
 ```bash
-sudo certbot --nginx -d xiangqi.example.com \
+sudo certbot --nginx -d <你的域名> \
   --non-interactive --agree-tos --register-unsafely-without-email --redirect
 ```
 

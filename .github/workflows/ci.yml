@@ -1,6 +1,6 @@
 # 持续集成：每次推送与 PR 都跑后端规则测试和前端测试构建。
 #
-# 主仓库：https://github.com/example-user/chinese-chess
+# 主仓库地址见仓库设置；文档里不写死用户名。
 # 之前主仓库在 Gitee、靠镜像同步到 GitHub；迁到 GitHub 后不再需要那层镜像，
 # push 到 main/dev 直接触发。
 name: CI

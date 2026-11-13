@@ -1,0 +1,57 @@
+# 中国象棋在线对战 —— 反代到 xiangqi-server（127.0.0.1:8080）
+#
+# 这是模板：部署时 scripts/deploy.sh 会把域名占位符替换成 deploy/.env 里
+# XIANGQI_DOMAIN 的值，再分发到服务器。仓库里不保存真实域名。
+# （注释里刻意不写占位符字面量，否则渲染时它也会被替换掉。）
+#
+# 这个站点重度依赖 WebSocket：大厅、对局、观战、在线名单全靠 WS 推送，
+# 所以必须透传 Upgrade 头，否则页面能打开、但进对局就连不上。
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    server_name __DOMAIN__;
+
+    client_max_body_size 8m;
+
+    # 令牌经 ?token= 传给 WebSocket（浏览器无法给握手加自定义头）。
+    # chess_safe 这个 format 只记路径，不记查询串，避免把令牌写进磁盘日志。
+    access_log /var/log/nginx/chess.access.log chess_safe;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        # WebSocket 透传（对局室是长连接）
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 一局棋可能挂很久，读超时给足，否则长连接会被 nginx 掐断。
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/__DOMAIN__/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+}
+
+server {
+    if ($host = __DOMAIN__) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+    listen 80;
+    server_name __DOMAIN__;
+    return 404; # managed by Certbot
+}
