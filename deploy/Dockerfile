@@ -5,7 +5,7 @@
 # 必须在仓库根执行构建，因为上下文要同时包含 web/ 与 server/。
 
 # ---- 第 1 段：构建 Vue 前端 ----
-FROM node:22.23.4-alpine AS web
+FROM node:26.13.0-alpine AS web
 WORKDIR /app/web
 
 # npm 源：默认官方 registry。境内构建慢时用
