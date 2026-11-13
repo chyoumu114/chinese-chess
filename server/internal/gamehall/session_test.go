@@ -1168,12 +1168,24 @@ type fakeRecorder struct {
 	moves       []recordedMove
 	results     []Result
 	ratingCalls []ratingCall
+	truncations []truncateCall
+}
+
+// truncateCall records one TruncateMoves call.
+type truncateCall struct {
+	GameID  int64
+	KeepPly int
+	FEN     string
 }
 
 func (f *fakeRecorder) StartGame(ctx context.Context, gameID int64) error { return nil }
 
 func (f *fakeRecorder) AddMove(ctx context.Context, gameID int64, m MoveRecord) {
 	f.moves = append(f.moves, recordedMove{GameID: gameID, Move: m})
+}
+
+func (f *fakeRecorder) TruncateMoves(ctx context.Context, gameID int64, keepPly int, fen string) {
+	f.truncations = append(f.truncations, truncateCall{GameID: gameID, KeepPly: keepPly, FEN: fen})
 }
 
 func (f *fakeRecorder) FinishGame(ctx context.Context, gameID int64, r Result) {

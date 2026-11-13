@@ -148,6 +148,28 @@ func (s *Store) AddMove(ctx context.Context, gameID int64, m Move) error {
 	return tx.Commit()
 }
 
+// TruncateMoves removes every ply after keepPly and restores the game's
+// denormalised position. It is the persistence half of a takeback: without it the
+// next move that reuses a ply number collides with uk_moves_game_ply and the
+// store silently drops the new branch.
+func (s *Store) TruncateMoves(ctx context.Context, gameID int64, keepPly int, fen string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin truncate tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM moves WHERE game_id = ? AND ply > ?`, gameID, keepPly); err != nil {
+		return fmt.Errorf("store: truncate moves: %w", wrap(err))
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE games SET fen = ?, move_count = ? WHERE id = ?`, fen, keepPly, gameID); err != nil {
+		return fmt.Errorf("store: reset game counters: %w", wrap(err))
+	}
+	return tx.Commit()
+}
+
 // GameResult carries everything needed to record a finished game. It is a
 // standalone struct, rather than the Game row type, so that packages which
 // manage live games can persist results without importing this package's row

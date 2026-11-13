@@ -65,6 +65,10 @@ func (r *memRecorder) StartGame(ctx context.Context, gameID int64) error { retur
 func (r *memRecorder) AddMove(ctx context.Context, gameID int64, m gamehall.MoveRecord) {
 	_ = r.mem.AddMove(ctx, gameID, memMove(m))
 }
+func (r *memRecorder) TruncateMoves(ctx context.Context, gameID int64, keepPly int, fen string) {
+	_ = r.mem.TruncateMoves(ctx, gameID, keepPly, fen)
+}
+
 func (r *memRecorder) FinishGame(ctx context.Context, gameID int64, res gamehall.Result) {
 	_ = r.mem.FinishGame(ctx, gameID, memResult(res))
 }

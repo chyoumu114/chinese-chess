@@ -245,6 +245,30 @@ func (s *Store) AddMove(ctx context.Context, gameID int64, m store.Move) error {
 	return nil
 }
 
+// TruncateMoves drops plies after keepPly and restores the game's position. It
+// mirrors the SQL backend so the in-memory path behaves the same way during a
+// takeback.
+func (s *Store) TruncateMoves(ctx context.Context, gameID int64, keepPly int, fen string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	g, ok := s.games[gameID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	kept := s.moves[gameID][:0]
+	for _, m := range s.moves[gameID] {
+		if m.Ply <= keepPly {
+			kept = append(kept, m)
+		}
+	}
+	s.moves[gameID] = kept
+	g.FEN = fen
+	g.MoveCount = keepPly
+	s.games[gameID] = g
+	return nil
+}
+
 // FinishGame records the result.
 func (s *Store) FinishGame(ctx context.Context, id int64, r store.GameResult) error {
 	s.mu.Lock()

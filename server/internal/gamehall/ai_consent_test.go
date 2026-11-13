@@ -72,6 +72,9 @@ func TestAIAcceptsDrawOffer(t *testing.T) {
 // （两个半回合），而不是只撤电脑那一步——否则电脑会把同一着再走一遍。
 func TestAIAcceptsTakeback(t *testing.T) {
 	s, _ := newTestSession(t)
+	// 换成带 recorder 的实例：接下来说明悔棋是否回滚了持久化。
+	rec := &fakeRecorder{}
+	s = NewSession(s.Config(), rec)
 	ctx := context.Background()
 	roomID, _ := aiGame(t, s, ctx)
 
@@ -108,6 +111,13 @@ func TestAIAcceptsTakeback(t *testing.T) {
 	}
 	if after.Status != StatusPlaying {
 		t.Errorf("status = %q, want playing", after.Status)
+	}
+	// 悔棋必须同时回滚持久化：否则新分支会撞上 (game_id, ply) 唯一键，
+	// 后续棋步被静默丢弃，棋谱与棋盘对不上。
+	if len(rec.truncations) == 0 {
+		t.Error("悔棋后没有调用 TruncateMoves，持久化里仍留着被撤的棋步")
+	} else if last := rec.truncations[len(rec.truncations)-1]; last.KeepPly != 0 {
+		t.Errorf("应当截断到 0 步，实际 keepPly=%d", last.KeepPly)
 	}
 }
 

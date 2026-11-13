@@ -105,6 +105,11 @@ type Recorder interface {
 	StartGame(ctx context.Context, gameID int64) error
 	// AddMove appends a ply.
 	AddMove(ctx context.Context, gameID int64, m MoveRecord)
+	// TruncateMoves drops every ply after keepPly and restores the game's
+	// denormalised position. A takeback rewinds the board; without this the store
+	// still holds the old plies, and the next move that reuses a ply number hits
+	// uk_moves_game_ply and is silently lost.
+	TruncateMoves(ctx context.Context, gameID int64, keepPly int, fen string)
 	// FinishGame records the result.
 	FinishGame(ctx context.Context, gameID int64, r Result)
 	// Finish updates both players' ratings and counters. The deltas are added to
@@ -448,7 +453,10 @@ func (s *Session) joinMatchmaking(req JoinRequest) (int64, game.Side, error) {
 		return r.ID, side, nil
 	}
 
-	r := s.newRoomLocked(req.Rated)
+	// The client does not get to decide whether a game counts for rating: a loss
+	// could otherwise be dodged by asking for an unrated room. The server's
+	// RatedDefault is authoritative.
+	r := s.newRoomLocked(nil)
 	s.seat(r, game.Red, req.UserID, req.Name, false, 0)
 	s.enqueueWaitingLocked(r)
 	s.notify([]int64{r.ID})
@@ -458,7 +466,10 @@ func (s *Session) joinMatchmaking(req JoinRequest) (int64, game.Side, error) {
 // joinAI opens a room whose opponent is the computer. The computer is always
 // ready, so such a game starts as soon as it is created.
 func (s *Session) joinAI(req JoinRequest) (int64, game.Side, error) {
-	r := s.newRoomLocked(req.Rated)
+	// The client does not get to decide whether a game counts for rating: a loss
+	// could otherwise be dodged by asking for an unrated room. The server's
+	// RatedDefault is authoritative.
+	r := s.newRoomLocked(nil)
 
 	humanSide := game.Red
 	switch strings.ToLower(strings.TrimSpace(req.Side)) {
@@ -1205,13 +1216,24 @@ func (s *Session) acceptTakebackLocked(r *Room, side game.Side) {
 		return
 	}
 	if len(r.Moves) > 0 {
+		undone := r.Moves[len(r.Moves)-1]
 		r.Moves = r.Moves[:len(r.Moves)-1]
-	}
-	for _, other := range []game.Side{game.Red, game.Black} {
-		seat := r.SeatFor(other)
-		if seat.MoveCount > 0 && other == side.Opponent() {
+		// MoveCount counts plies per player, so it must go down on the side that
+		// made the rewinded move rather than always on the requester's opponent.
+		// The two differ when the AI answers twice: each accept rewinds one more
+		// ply, and they belong to different players.
+		moved := game.Red
+		if undone.Side == SideName(game.Black) {
+			moved = game.Black
+		}
+		if seat := r.SeatFor(moved); seat.MoveCount > 0 {
 			seat.MoveCount--
 		}
+	}
+	// Keep the stored game in step with the board. The recorder is synchronous, so
+	// this lands before any new move that reuses the same ply numbers.
+	if s.recorder != nil {
+		s.recorder.TruncateMoves(context.Background(), r.PersistedID, len(r.Moves), r.Game.FEN())
 	}
 	s.armClockLocked(r)
 }

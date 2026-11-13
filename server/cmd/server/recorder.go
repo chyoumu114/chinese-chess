@@ -17,6 +17,7 @@ import (
 type GameStore interface {
 	StartGame(ctx context.Context, gameID int64) error
 	AddMove(ctx context.Context, gameID int64, m store.Move) error
+	TruncateMoves(ctx context.Context, gameID int64, keepPly int, fen string) error
 	FinishGame(ctx context.Context, gameID int64, r store.GameResult) error
 	ApplyResult(ctx context.Context, redID, blackID int64, redDelta, blackDelta int) error
 	CreateGame(ctx context.Context, g store.Game) (store.Game, error)
@@ -35,6 +36,13 @@ func (r *storeRecorder) StartGame(ctx context.Context, gameID int64) error {
 		return nil
 	}
 	return r.api.StartGame(ctx, gameID)
+}
+
+// TruncateMoves keeps the stored game in step with a takeback.
+func (r *storeRecorder) TruncateMoves(ctx context.Context, gameID int64, keepPly int, fen string) {
+	// Same policy as AddMove: a failed write must not roll the game back in
+	// memory, the board is authoritative.
+	_ = r.api.TruncateMoves(ctx, gameID, keepPly, fen)
 }
 
 // AddMove appends a ply. A failed insert must not roll the game back in memory,
