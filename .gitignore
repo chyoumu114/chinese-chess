@@ -22,13 +22,18 @@ web/dist/
 .DS_Store
 Thumbs.db
 
-# Local overrides
+# ---- 私密配置：只提交 *.example ----
+#
+# 用通配而不是逐条列名：`.env.local` / `.env.deploy` / `.env.prod`
+# 这类变体太多，漏一个就等于把口令推上了仓库。例外用 ! 显式放行模板。
 .env
-.env.local
-# 显式再列一次：`.env` 模式本已匹配任意层级，这一行是为了防止
-# 日后有人把它改成 `/.env`（只匹配根目录），从而让 deploy/.env
-# 里的真实凭据被误提交。deploy/.env.example 是模板，仍需提交。
+.env.*
+!.env.example
 deploy/.env
-# 部署用的镜像仓库凭据与生产配置，同样绝不入库
-deploy/.env.deploy
-deploy/.env.prod
+deploy/.env.*
+!deploy/.env.example
+
+# 服务器清单里有公网 IP；只在本地保存，仓库里放 servers.example.json。
+deploy/servers.json
+# ssh-keyscan 的产物，同样属于环境信息。
+deploy/known_hosts

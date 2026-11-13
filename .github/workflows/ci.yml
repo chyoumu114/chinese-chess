@@ -1,7 +1,8 @@
 # 持续集成：每次推送与 PR 都跑后端规则测试和前端测试构建。
 #
-# 触发来源：主仓库在 Gitee，通过「仓库镜像管理」同步到 GitHub。
-# 镜像推送产生的 commit 同样会触发本工作流，所以本地开发不需要开代理。
+# 主仓库：https://github.com/example-user/chinese-chess
+# 之前主仓库在 Gitee、靠镜像同步到 GitHub；迁到 GitHub 后不再需要那层镜像，
+# push 到 main/dev 直接触发。
 name: CI
 
 on:

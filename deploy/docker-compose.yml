@@ -27,6 +27,13 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      # 目标机器只有 1.7 GiB 内存：mysql:8.4 默认的 performance_schema 常驻
+      # 150–200MB，而本项目数据只有几十 MB。关掉它并收紧 buffer/连接数后，
+      # 容器常驻内存从 ~457MB 降到 ~150MB。
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-log-buffer-size=16M
+      - --max-connections=50
     environment:
       MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?请在 deploy/.env 中设置 MYSQL_ROOT_PASSWORD}"
       MYSQL_DATABASE: "${MYSQL_DATABASE:-xiangqi}"

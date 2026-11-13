@@ -335,7 +335,7 @@ Navicat 里建连接，两个页面填完即可：
 |---|---|---|
 | 常规 | 主机 / 端口 | `127.0.0.1` / `3306`（**从服务器视角**解析，出口就是回环） |
 | 常规 | 用户名 / 密码 | `root` / `deploy/.env` 里的 `MYSQL_ROOT_PASSWORD` |
-| SSH | 主机 / 端口 | `<服务器IP>` / `22` |
+| SSH | 主机 / 端口 | `<服务器 IP>` / `22` |
 | SSH | 用户名 | `root` |
 | SSH | 验证方法 | 公钥 → 选 `xiangqi_deploy` 私钥 |
 
@@ -354,7 +354,7 @@ Navicat 里建连接，两个页面填完即可：
 
 ```bash
 # WSL 里执行，保持前台运行
-ssh -N -L 13306:127.0.0.1:3306 -i ~/.ssh/xiangqi_deploy root@<服务器IP>
+ssh -N -L 13306:127.0.0.1:3306 -i ~/.ssh/xiangqi_deploy root@<服务器 IP>
 ```
 
 然后 Navicat 直连 `127.0.0.1:13306`（不勾 SSH 隧道）。
