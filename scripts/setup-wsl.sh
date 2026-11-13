@@ -79,8 +79,17 @@ if [ -f "$DOCKER_LIST" ]; then
   echo "  软件源已存在，跳过"
 else
   sudo install -m 0755 -d /etc/apt/keyrings
+  # 从镜像站取回的公钥必须与 Docker 官方指纹一致：这把 key 能给任意 apt 包
+  # 签名，镜像站被劫持时它是最直接的投毒入口。
+  DOCKER_GPG_FINGERPRINT="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
   curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg |
     sudo gpg --dearmor -o "$KEYRING"
+  ACTUAL_FINGERPRINT="$(sudo gpg --show-keys --with-colons "$KEYRING" |
+    awk -F: '/^fpr:/ {print $10; exit}')"
+  if [ "$ACTUAL_FINGERPRINT" != "$DOCKER_GPG_FINGERPRINT" ]; then
+    echo "Docker GPG 公钥指纹不符（$ACTUAL_FINGERPRINT），拒绝继续" >&2
+    exit 1
+  fi
   sudo chmod a+r "$KEYRING"
 
   CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"

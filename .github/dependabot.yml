@@ -1,0 +1,23 @@
+version: 2
+# 依赖升级一律走 PR，人工复核后合并。
+#
+# 审计报告建议把 CI 里的 actions 固定到 commit SHA。仓库这边不写死 SHA ——
+# 编造的 SHA 会让工作流直接失败 —— 而是交给 Dependabot：它会在 PR 里把
+# `uses:` 升到新版本，按 PR 里的 diff 就能核对，再手工改成 SHA 也更省事。
+updates:
+  - package-ecosystem: gomod
+    directory: /server
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly

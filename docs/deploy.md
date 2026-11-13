@@ -356,3 +356,42 @@ cd web && npm install && npm run dev     # http://localhost:5173
 
 **`XIANGQI_RATE_LIMIT=off`** 会关闭全部令牌桶，只应在 e2e 与压测时使用：
 那些场景从同一个 IP 发起全部请求，正常限流会把它们误判成攻击。
+
+---
+
+## 13. 供应链加固现状
+
+审计报告（腾讯云鼎实验室方法论，`chinese-chess-安全审计报告.md`）列出的 5 项 Suspicious 处理情况：
+
+| 项 | 现状 |
+|---|---|
+| 依赖下载明文 HTTP + `GOSUMDB=off` | **已修**：`build.ps1` / `verify.ps1` / 各文档一律改 HTTPS，GOSUMDB 保持开启 |
+| 第三方镜像源 + GPG 指纹未校验 | **已修**：`deploy/Dockerfile` 默认官方源，境内用 `--build-arg` 显式切换；`setup-wsl.sh` 校验 Docker GPG 指纹 |
+| 未固定版本 / `npm install` | **部分**：`package.json` 精确版本 + `npm ci`；apt/apk 与基础镜像仍未钉版本 |
+| CI actions 未固定 SHA | **部分**：`.github/dependabot.yml` 每周提 PR；未手工钉 SHA |
+| heredoc 二次解析 / 注入面 | **已修**：`<<'REMOTE'` + 参数传值、`servers.json` 字段白名单、`prune --filter until=168h` |
+
+### 刻意没做的三处，及原因
+
+**1. lockfile 里 23 条 `resolved` 指向 `registry.npmmirror.com`**
+
+要彻底改回官方源必须用官方 registry 重新生成 `package-lock.json`，那会重算整棵依赖树：境内网络下可能耗时很久，且容易顺带引入版本漂移。当前状态下 Dockerfile 默认官方源、lock 里每个包都带 SRI `integrity`，**内容被篡改仍然挡得住**，只是「源被整体替换」这一层仍依赖镜像站自身可信。要彻底解决，请在有稳定外网的环境里执行：
+
+```bash
+cd web && rm -rf node_modules package-lock.json
+npm install --registry=https://registry.npmjs.org
+```
+
+**2. apt / apk 包与基础镜像 digest 未固定**
+
+把版本钉死会让镜像更新和安全补丁几乎无法进行（`docker-ce` 的小版本频繁变动，钉死后 `apt install` 会直接失败）。更实际的做法是把「持续发现」放进 CI：`trivy image <镜像>` 扫容器、`govulncheck ./...` 扫 Go 依赖、`npm audit` 扫前端，而不是靠钉版本。
+
+**3. CI 里的 actions 仍用大版本 tag**
+
+仓库这边**不写死 commit SHA**：编造的 SHA 会让工作流直接失败。已加 `.github/dependabot.yml`（覆盖 gomod / npm / github-actions / docker 四个生态），升级走 PR 人工复核。想手工固定某个 action 时：
+
+```bash
+# 查某个大版本 tag 现在指向哪个 commit
+git ls-remote --tags https://github.com/actions/checkout 'v4*' | tail -1
+# 然后改成：uses: actions/checkout@<commit>  # v4.x.y
+```

@@ -8,11 +8,11 @@
 FROM node:22.23.4-alpine AS web
 WORKDIR /app/web
 
-# npm 源：容器内默认访问 registry.npmjs.org，境内极慢甚至超时。
-# 若在境外环境构建，可用
-#   --build-arg NPM_REGISTRY=https://registry.npmjs.org
-# 换回官方源。
-ARG NPM_REGISTRY=https://registry.npmmirror.com
+# npm 源：默认官方 registry。境内构建慢时用
+#   --build-arg NPM_REGISTRY=https://registry.npmmirror.com
+# 显式切到镜像 —— 默认走可信通道，换源是明确的构建期选择而不是隐式默认。
+# scripts/deploy.sh 会在构建时按需传入镜像地址。
+ARG NPM_REGISTRY=https://registry.npmjs.org
 RUN npm config set registry "${NPM_REGISTRY}"
 
 # package-lock.json 已在仓库中，用 npm ci 严格按锁文件安装，保证构建可重现。
@@ -26,15 +26,15 @@ RUN npm run build
 FROM golang:1.27.3-alpine AS server
 WORKDIR /app/server
 
-# 模块代理：默认的 proxy.golang.org 在境内不可达，构建会直接失败。
+# 模块代理：默认官方源，境内不可达时用 --build-arg 显式切换（见 deploy.sh）。
 #
 # GOSUMDB 必须保留默认值，**不能设成 off**：golang:1.27.3-alpine 镜像自带
 # GOTOOLCHAIN=go1.27.3，而镜像里的编译器其实只有 1.26.10，首次构建需要下载
 # 1.27.3 工具链；关闭校验会让这个下载被直接拒绝：
 #   go: golang.org/toolchain@v0.0.1-go1.27.3.linux-amd64: verifying module:
 #   checksum database disabled by GOSUMDB=off
-# 校验请求会经由上面的 GOPROXY（goproxy.cn 提供 sumdb 代理），境内可达。
-ARG GOPROXY_URL=https://goproxy.cn,direct
+# 第三方代理（goproxy.cn 等）会代理 sum.golang.org，校验仍然成立。
+ARG GOPROXY_URL=https://proxy.golang.org,direct
 ENV GOPROXY=${GOPROXY_URL} \
     GOSUMDB=sum.golang.org
 
@@ -52,8 +52,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 FROM alpine:3.20
 
 # Alpine 的软件源一并换成国内镜像，避免 apk 拉包超时。
-RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories && \
-    apk add --no-cache ca-certificates tzdata wget && \
+# 用发行版自带的官方 apk 源；不替换成镜像，避免依赖链多一个可被替换的环节。
+RUN apk add --no-cache ca-certificates tzdata wget && \
     adduser -D -u 10001 app
 
 WORKDIR /app

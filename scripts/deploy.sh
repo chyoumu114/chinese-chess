@@ -113,9 +113,12 @@ log "3/5 构建镜像"
 # 阿里云 ACR 不认识它，推送时会报：
 #   error from registry: unknown manifest class for application/vnd.oci.empty.v1+json
 # 关掉这两个附件后推送正常（已在本机对 ACR 实测通过）。
+# 依赖源默认是官方地址；境内构建可直接用环境变量覆盖（显式选择，不写死在 Dockerfile）。
 docker build \
   --provenance=false \
   --sbom=false \
+  --build-arg "NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}" \
+  --build-arg "GOPROXY_URL=${GOPROXY_URL:-https://goproxy.cn,direct}" \
   -f "$DEPLOY_DIR/Dockerfile" \
   -t "$IMAGE_TAG" \
   "$REPO_ROOT"
