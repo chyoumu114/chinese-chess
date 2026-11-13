@@ -264,7 +264,7 @@ Windows 浏览器直接打开 <http://127.0.0.1:5173> 即可，改代码即时�
 
 ## 3. 方案 B：代码留 Windows，用 Run Target 推到 WSL
 
-适合"不想动现有 `E:\WORK\project\chinese-chess`"的场景。
+适合"不想动现有工作区"的场景。
 
 **Run | Manage Targets → Add Target → WSL**，然后：
 
