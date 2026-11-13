@@ -31,16 +31,17 @@ function Initialize-BuildEnv {
         New-Item -ItemType Directory -Force -Path (Join-Path $cache $d) | Out-Null
     }
 
-    # Go: module proxy over HTTP, checksum database off (it needs HTTPS).
+    # Go: module proxy over HTTPS. The checksum database stays enabled —
+    # goproxy.cn proxies sum.golang.org, so verification works without direct
+    # egress. Turning it off would let a first download be swapped silently.
     $env:GOCACHE = Join-Path $cache 'go-build'
     $env:GOMODCACHE = Join-Path $cache 'go-mod'
-    if (-not $env:GOPROXY) { $env:GOPROXY = 'http://goproxy.cn' }
-    $env:GOSUMDB = 'off'
+    if (-not $env:GOPROXY) { $env:GOPROXY = 'https://goproxy.cn,direct' }
     $env:GOTOOLCHAIN = 'local'
     $env:GOFLAGS = '-mod=mod'
 
-    # npm: registry over HTTP and a workspace-local cache.
-    if (-not $env:npm_config_registry) { $env:npm_config_registry = 'http://registry.npmmirror.com' }
+    # npm: registry over HTTPS and a workspace-local cache.
+    if (-not $env:npm_config_registry) { $env:npm_config_registry = 'https://registry.npmmirror.com' }
     $env:npm_config_cache = Join-Path $cache 'npm'
     $env:npm_config_fund = 'false'
     $env:npm_config_audit = 'false'

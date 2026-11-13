@@ -8,18 +8,18 @@ Vue 3（`<script setup>` + Composition API）+ Vite + Vue Router 实现的单页
 
 ## 安装
 
-后端默认监听 `http://127.0.0.1:8080`。依赖通过 HTTP 镜像安装，并使用工作区内的 npm
-缓存（本机无 HTTPS 出网）：
+后端默认监听 `http://127.0.0.1:8080`。依赖通过 HTTPS 镜像安装，并使用工作区内的
+npm 缓存：
 
 ```powershell
-$ws = 'E:\WORK\project\chinese-chess'
+$ws = '<仓库根目录>'
 Set-Location "$ws\web"
-$env:npm_config_registry = 'http://registry.npmmirror.com'
+$env:npm_config_registry = 'https://registry.npmmirror.com'
 $env:npm_config_cache    = "$ws\.cache\npm"
 $env:npm_config_fund     = 'false'
 $env:npm_config_audit    = 'false'
 $env:npm_config_update_notifier = 'false'
-npm install
+npm ci
 ```
 
 > **受限 shell / 沙箱**：`npm install` 的 rebuild 阶段会以管道（pipe）方式启动依赖的

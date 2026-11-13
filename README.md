@@ -124,9 +124,9 @@ compose 编排里显式传了 `-no-create-db`，因为容器使用的普通 MySQ
 
 ### 3. 构建与运行
 
-本机没有 HTTPS 出口，因此 npm 与 Go 模块代理都需要走 HTTP，且缓存必须放在
-工作区内（默认缓存目录在工作区之外，会被文件沙箱拒绝）。`scripts/build.ps1`
-已经把这些环境变量都设好了。
+依赖代理走 HTTPS：`goproxy.cn` 会代理校验和数据库，所以 **GOSUMDB 保持开启**，
+首次下载就能校验；关掉它会丧失这层防护。缓存必须放在工作区内（默认缓存目录在
+工作区之外，会被文件沙箱拒绝）。`scripts/build.ps1` 已经把这些环境变量都设好了。
 
 > 脚本调用的写法：本机可能只有 Windows PowerShell（`powershell.exe`），
 > 且默认执行策略禁止运行未签名脚本，所以请用：
@@ -154,12 +154,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -Task run
 ```powershell
 $ws = (Get-Location).Path
 $env:GOCACHE="$ws\.cache\go-build"; $env:GOMODCACHE="$ws\.cache\go-mod"
-$env:GOPROXY='http://goproxy.cn'; $env:GOSUMDB='off'; $env:GOTOOLCHAIN='local'
+$env:GOPROXY='https://goproxy.cn,direct'; $env:GOTOOLCHAIN='local'
 
-$env:npm_config_registry='http://registry.npmmirror.com'
+$env:npm_config_registry='https://registry.npmmirror.com'
 $env:npm_config_cache="$ws\.cache\npm"
 
-cd web;   npm install --ignore-scripts; npm run build; cd ..
+cd web;   npm ci; npm run build; cd ..
 cd server; go test ./... -count=1; go run ./cmd/server
 ```
 

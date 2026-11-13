@@ -68,7 +68,6 @@ source ~/.bashrc
 
 # 3) 走国内模块代理（proxy.golang.org 在境内不可达）
 go env -w GOPROXY=https://goproxy.cn,direct
-go env -w GOSUMDB=off
 
 go version    # 期望 go1.26.5 linux/amd64
 

@@ -33,16 +33,15 @@ function Check($condition, $description) {
 }
 
 # ---- environment -----------------------------------------------------------
-# This machine has no HTTPS egress and the default caches live outside the
-# workspace, so both must be redirected. See scripts/build.ps1 for the details.
+# The default caches live outside the workspace, so they are redirected here.
+# Proxy and registry use HTTPS; see scripts/build.ps1 for the details.
 $cache = Join-Path $root '.cache'
 foreach ($d in 'go-build', 'go-mod', 'npm') {
     New-Item -ItemType Directory -Force -Path (Join-Path $cache $d) | Out-Null
 }
 $env:GOCACHE = Join-Path $cache 'go-build'
 $env:GOMODCACHE = Join-Path $cache 'go-mod'
-if (-not $env:GOPROXY) { $env:GOPROXY = 'http://goproxy.cn' }
-$env:GOSUMDB = 'off'
+if (-not $env:GOPROXY) { $env:GOPROXY = 'https://goproxy.cn,direct' }
 $env:GOTOOLCHAIN = 'local'
 $env:GOFLAGS = '-mod=mod'
 

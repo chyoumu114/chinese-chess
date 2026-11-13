@@ -199,14 +199,19 @@ deploy_one() {
     "$tmp_env" "$user@$host:$app_dir/deploy/.env"
   rm -f "$tmp_env"
 
-  # heredoc 未加引号：$VAR 在本地展开后再交给远端 bash
-  ssh $ssh_opts "$user@$host" bash -s <<REMOTE
+  # 带引号的 heredoc：远端只展开自己的变量，本地值通过参数传入。
+  # 不加引号时，Secrets 里的 $、反引号、引号会在远端被 bash 二次解析，
+  # 等于把配置内容当代码执行。
+  ssh $ssh_opts "$user@$host" bash -s -- \
+    "$app_dir" "$ACR_REGISTRY" "$ACR_USERNAME" "$ACR_PASSWORD" <<'REMOTE'
 set -euo pipefail
-cd "$app_dir/deploy"
-printf '%s' "$ACR_PASSWORD" | docker login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
+APP_DIR="$1"; REGISTRY="$2"; USERNAME="$3"; PASSWORD="$4"
+cd "$APP_DIR/deploy"
+printf '%s' "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
 docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
-docker image prune -f >/dev/null
+# 只清理一周前的悬空镜像：刚回滚要用的镜像不该被顺手删掉。
+docker image prune -f --filter "until=168h" >/dev/null
 docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
 
 # 站点反代配置随之生效（含 HTTPS）。没有 nginx 的机器跳过。
@@ -239,13 +244,33 @@ while IFS='|' read -r name host port user app_dir; do
     warn "$name 部署失败"
   fi
 done < <(python3 - "$SERVERS_JSON" <<'PY'
-import json, sys
+import json, re, sys
+
+# 这些值会拼进 ssh / scp 的命令行。servers.json 只在本地维护，但一旦被改动，
+# 未加校验的 app_dir 就能注入任意远端命令，所以字符集必须白名单化。
+RULES = {
+    "name": re.compile(r"^[A-Za-z0-9._-]{1,64}$"),
+    "host": re.compile(r"^[A-Za-z0-9._:-]{1,253}$"),
+    "user": re.compile(r"^[A-Za-z0-9._-]{1,32}$"),
+    "app_dir": re.compile(r"^/[A-Za-z0-9._/-]{0,200}$"),
+}
+
+
+def checked(field, value):
+    pattern = RULES[field]
+    if not isinstance(value, str) or not pattern.match(value):
+        sys.exit("servers.json: %s 含非法字符，拒绝部署: %r" % (field, value))
+    return value
+
+
 with open(sys.argv[1], encoding="utf-8") as fh:
     for s in json.load(fh):
-        print("|".join([
-            s["name"], s["host"], str(s.get("port", 22)),
-            s.get("user", "root"), s.get("app_dir", "/opt/xiangqi"),
-        ]))
+        name = checked("name", s.get("name"))
+        host = checked("host", s.get("host"))
+        user = checked("user", s.get("user", "root"))
+        app_dir = checked("app_dir", s.get("app_dir", "/opt/xiangqi"))
+        port = int(s.get("port", 22))
+        print("|".join([name, host, str(port), user, app_dir]))
 PY
 )
 
