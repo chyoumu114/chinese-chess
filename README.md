@@ -194,6 +194,10 @@ cd server; go run ./cmd/server
 
 ## 用 Docker 部署
 
+> **要部署到线上服务器**（域名、HTTPS、nginx 反代、GitHub Actions）请看
+> [docs/deploy.md](docs/deploy.md) —— 从一台干净机器到可访问的完整清单。
+> 下面这段是最小化的手工构建/运行方式，适合本地验证镜像。
+
 ```bash
 # 在仓库根目录执行（构建上下文需要同时包含 web 与 server）
 docker build -f deploy/Dockerfile -t xiangqi:latest .
