@@ -23,7 +23,7 @@ COPY web/ ./
 RUN npm run build
 
 # ---- 第 2 段：编译 Go 服务端 ----
-FROM golang:1.27.3-alpine AS server
+FROM golang:1.27.4-alpine AS server
 WORKDIR /app/server
 
 # 模块代理：默认官方源，境内不可达时用 --build-arg 显式切换（见 deploy.sh）。
