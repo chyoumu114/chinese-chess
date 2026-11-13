@@ -49,7 +49,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/xiangqi ./cmd/server
 
 # ---- 第 3 段：运行时 ----
-FROM alpine:3.20
+FROM alpine:3.24
 
 # Alpine 的软件源一并换成国内镜像，避免 apk 拉包超时。
 # 用发行版自带的官方 apk 源；不替换成镜像，避免依赖链多一个可被替换的环节。
