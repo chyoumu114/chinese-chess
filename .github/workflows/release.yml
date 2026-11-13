@@ -81,7 +81,7 @@ jobs:
           echo "本次镜像：${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${TAG}"
 
       - name: 登录阿里云 ACR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ secrets.ACR_REGISTRY }}
           username: ${{ secrets.ACR_USERNAME }}
