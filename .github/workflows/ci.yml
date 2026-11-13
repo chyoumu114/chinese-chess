@@ -29,7 +29,7 @@ jobs:
         working-directory: server
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安装 Go（版本直接取自 server/go.mod）
         uses: actions/setup-go@v5
@@ -54,7 +54,7 @@ jobs:
         working-directory: web
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安装 Node（与 deploy/Dockerfile 的 node:22.23.4 保持一致）
         uses: actions/setup-node@v4
