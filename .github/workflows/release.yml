@@ -39,7 +39,7 @@ jobs:
       exists: ${{ steps.list.outputs.exists }}
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 读取 deploy/servers.json
         id: list
@@ -63,7 +63,7 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 计算镜像地址
         id: meta
@@ -115,7 +115,7 @@ jobs:
         server: ${{ fromJSON(needs.prepare.outputs.servers) }}
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 配置 SSH 密钥
         env:
